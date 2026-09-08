@@ -39,3 +39,22 @@ Extended Array Interface
 For advanced use cases where you manage packed extended arrays directly.
 
 .. autofunction:: nvalchemiops.torch.fire2.fire2_step_extended
+
+L-BFGS Optimizer
+----------------
+
+Quasi-Newton relaxation with a strong Wolfe line search. Each step consumes one
+energy/force evaluation and reports progress through ``state.status``.
+
+.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_allocate_state
+.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_reset
+.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_reduce_energy
+.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_step_coord
+.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_step_extended
+
+Variable-cell relaxation maps coordinates and cell into one packed coordinate
+vector, so the two-loop recursion couples them automatically.
+
+.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_allocate_cell_state
+.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_set_reference_cell
+.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_step_coord_cell

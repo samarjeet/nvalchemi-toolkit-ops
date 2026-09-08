@@ -278,3 +278,20 @@ To add new benchmarks:
 - See documentation: `../../docs/benchmarks/`
 - Check configuration: `benchmark_config.yaml`
 - Review shared utilities: `shared_utils.py`
+
+## `benchmark_lbfgs.py`
+
+Compares L-BFGS with FIRE2 by **energy/force evaluations to convergence**,
+which is the cost that dominates relaxation driven by a machine-learned
+potential. The system is a Lennard-Jones cluster in reduced units; FIRE2's
+timestep and step cap are swept per case and its best configuration reported,
+so the comparison is not skewed by an untuned baseline.
+
+```bash
+python -m benchmarks.dynamics.benchmark_lbfgs \
+    --sizes 13 32 55 --seeds 5 --force-tol 1e-4 \
+    --output-dir ./benchmark_results
+```
+
+Writes `lbfgs_vs_fire2_evaluations.csv`. Runs that hit the evaluation cap are
+flagged; their ratios are upper bounds on L-BFGS's advantage.

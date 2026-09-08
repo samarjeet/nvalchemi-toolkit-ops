@@ -120,6 +120,32 @@ Fast Inertial Relaxation Engine for geometry optimization.
 .. autofunction:: nvalchemiops.dynamics.optimizers.fire.fire_step
 .. autofunction:: nvalchemiops.dynamics.optimizers.fire.fire_update
 
+L-BFGS
+~~~~~~
+
+Limited-memory quasi-Newton optimizer with a strong Wolfe line search. Each
+:func:`~nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_step` call consumes exactly
+one energy/force evaluation and reports progress through a per-system ``status``
+array, so a whole batch relaxes in one stream of kernel launches.
+
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_step
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_update
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_prepare_step
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_apply_step
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_reduce
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_reduce_energy
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_reset
+
+Variable-cell relaxation maps positions and cell into a single packed
+coordinate vector, so the two-loop recursion couples them automatically.
+
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_set_reference_cell
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_cell_kappa
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_pack_cell
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_unpack_cell
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_step_coord_cell
+.. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.lbfgs_cell_trust_region
+
 FIRE2
 ~~~~~
 

@@ -49,6 +49,17 @@ from nvalchemiops.torch.fire2 import (
     fire2_step_coord_cell_mix,
     fire2_step_extended,
 )
+from nvalchemiops.torch.lbfgs import (
+    LBFGS_CONVERGED,
+    LBFGS_LS_FAILED,
+    LBFGS_NEED_EVAL,
+    LBFGSState,
+    lbfgs_allocate_state,
+    lbfgs_reduce_energy,
+    lbfgs_reset,
+    lbfgs_step_coord,
+    lbfgs_step_extended,
+)
 from nvalchemiops.torch.segment_ops import (
     segmented_dot,
     segmented_matvec,
@@ -81,4 +92,13 @@ __all__ = [
     "segmented_mul",
     "segmented_rms_norm",
     "segmented_sum",
+    "LBFGSState",
+    "LBFGS_NEED_EVAL",
+    "LBFGS_CONVERGED",
+    "LBFGS_LS_FAILED",
+    "lbfgs_allocate_state",
+    "lbfgs_reset",
+    "lbfgs_reduce_energy",
+    "lbfgs_step_coord",
+    "lbfgs_step_extended",
 ]

@@ -446,6 +446,83 @@ fire2_step_coord_cell(
 - Improved convergence compared to original FIRE
 - PyTorch adapters handle tensor conversion automatically
 
+### L-BFGS (Limited-memory Quasi-Newton)
+
+L-BFGS builds an implicit approximation to the inverse Hessian from the last
+few position and gradient differences and uses it to pick a search direction,
+then chooses a step length with a strong Wolfe line search. It usually reaches
+a given force tolerance in far fewer energy/force evaluations than FIRE or
+FIRE2 — the cost that dominates relaxation with a machine-learned potential.
+
+**Choosing between FIRE2 and L-BFGS.** FIRE2 costs one force evaluation per
+step and carries almost no state, which makes it a good fit for very large
+systems or for starting geometries far from any minimum. L-BFGS spends more
+memory (`2 * m` history vectors) and may take several evaluations in a single
+iteration while the line search settles, but converges in fewer evaluations
+overall on smooth potentials. If your force evaluation is expensive relative to
+a handful of microseconds of kernel time, prefer L-BFGS.
+
+**You own the loop.** Each `lbfgs_step` call consumes exactly one energy/force
+evaluation. Inspect `status` to decide when to stop:
+
+```python
+import numpy as np
+import warp as wp
+from nvalchemiops.dynamics.optimizers import (
+    LBFGS_NEED_EVAL,
+    lbfgs_reduce_energy,
+    lbfgs_reset,
+    lbfgs_step,
+)
+
+# `state` holds the optimizer's arrays; allocate once and reuse.
+lbfgs_reset(**state)
+
+while True:
+    per_atom_energy, forces = model(positions)
+    lbfgs_reduce_energy(per_atom_energy, batch_idx, energy)
+    lbfgs_step(
+        positions=positions,
+        forces=forces,
+        energy=energy,
+        batch_idx=batch_idx,
+        n_particles=n_particles,
+        force_tol=0.05,   # eV/A, on the largest per-atom force
+        maxstep=0.2,      # A, largest displacement in one step
+        **state,
+    )
+    if not (status.numpy() == LBFGS_NEED_EVAL).any():
+        break
+```
+
+`status` takes three values per system:
+
+| Value | Meaning |
+| --- | --- |
+| `LBFGS_NEED_EVAL` | Keep going; `positions` hold a new trial point. |
+| `LBFGS_CONVERGED` | Done; `positions` hold the relaxed geometry. |
+| `LBFGS_LS_FAILED` | The line search stalled. `positions` were restored to the last accepted point. |
+
+`LBFGS_LS_FAILED` is not a convergence claim. If you consider a stalled search
+with acceptably small forces to be a success, apply that policy yourself from
+`status` and the returned forces.
+
+**Batching.** Systems are identified by a sorted `batch_idx` and relax
+independently: each runs its own line search and keeps its own history, and
+systems that finish early are skipped by the remaining kernels. Note that
+`n_particles` is the atom count per system, used by the optional RMS
+convergence criterion.
+
+**Supplying energy.** Pass per-atom energies through `lbfgs_reduce_energy`
+rather than summing them yourself in single precision. The Armijo test compares
+a difference of *total* energies, and at `E ~ -1e4 eV` a float32 total is
+rounded to about `1e-3 eV` — enough to make the line search unreliable near
+convergence. Summing per-atom values in float64 avoids this.
+
+**Memory.** The history dominates: `2 * m` vectors of `num_dofs` each. At
+`m = 6` and float32 coordinates that is roughly `192` bytes per degree of
+freedom. Reduce `m` if memory is tight; `m` between 3 and 7 is typical.
+
 ## Temperature Control Utilities
 
 ### Computing Temperature

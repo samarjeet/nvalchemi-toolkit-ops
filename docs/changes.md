@@ -2,6 +2,28 @@
 
 # Change Log
 
+## Unreleased
+
+### Added
+
+- New L-BFGS geometry optimizer, with a Warp core plus PyTorch and JAX
+  bindings. L-BFGS is a quasi-Newton method: it builds an approximation to the
+  inverse Hessian from recent position and gradient differences and picks a
+  step length with a strong Wolfe line search. On Lennard-Jones clusters it
+  reaches a given force tolerance in roughly a fifth of the energy/force
+  evaluations FIRE2 needs, which is the cost that dominates relaxation with a
+  machine-learned potential.
+- The optimizer is caller-driven: each step consumes exactly one energy/force
+  evaluation and reports progress through a per-system `status` array, so a
+  whole batch relaxes in one stream of kernel launches with no per-system host
+  control flow.
+- Both coordinate-only and variable-cell relaxation are supported. The
+  variable-cell path maps positions and cell into a single packed coordinate
+  vector following ASE's `UnitCellFilter` convention, so the two-loop recursion
+  couples them without special handling, and convergence is always evaluated on
+  the Cartesian forces and the stress so tolerances keep their physical meaning
+  as the cell deforms.
+
 ## v0.4.1 - 2026-08-03
 
 ### Added
