@@ -295,3 +295,14 @@ python -m benchmarks.dynamics.benchmark_lbfgs \
 
 Writes `lbfgs_vs_fire2_evaluations.csv`. Runs that hit the evaluation cap are
 flagged; their ratios are upper bounds on L-BFGS's advantage.
+
+### Per-step cost gates
+
+```bash
+python -m benchmarks.dynamics.benchmark_lbfgs --gates
+```
+
+Reports optimizer-only step time against FIRE2 at scale, what CUDA-graph replay
+recovers, and the break-even model cost. The step issues far more kernels than
+FIRE2, so at small sizes it is entirely Python-launch-bound; capture the step in
+a CUDA graph if that matters for your workload.

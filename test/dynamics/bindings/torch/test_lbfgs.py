@@ -180,6 +180,56 @@ class TestLBFGSTorchState:
         assert d.state.alpha_step.item() == 1.0
         assert d.state.status.item() == LBFGS_NEED_EVAL
 
+    @pytest.mark.parametrize("device", DEVICES)
+    @pytest.mark.parametrize("history_size", [4, 6, 8])
+    @pytest.mark.parametrize("num_dofs", [10_000, 100_000])
+    @pytest.mark.parametrize("dtype", DTYPES)
+    def test_memory_matches_the_documented_formula(
+        self, device, history_size, num_dofs, dtype
+    ):
+        """State size must match what the documentation promises.
+
+        Callers size ``history_size`` against a memory budget, so the published
+        formula has to stay true as fields are added or removed::
+
+            (2m + 3) * 3 * sizeof(dof) * num_dofs   per-DOF vectors + s/y history
+          + (4m + 11) * 8 * num_systems             per-slot and per-system float64
+          +        6  * 4 * num_systems             per-system int32
+        """
+        num_systems = 8
+        element_size = 4 if dtype == torch.float32 else 8
+        expected = (
+            (2 * history_size + 3) * 3 * element_size * num_dofs
+            + (4 * history_size + 11) * 8 * num_systems
+            + 6 * 4 * num_systems
+        )
+
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated(device)
+        state = lbfgs_allocate_state(
+            num_dofs,
+            num_systems,
+            dtype=dtype,
+            device=device,
+            history_size=history_size,
+        )
+        torch.cuda.synchronize()
+        measured = sum(
+            getattr(state, f).numel() * getattr(state, f).element_size()
+            for f in state._fields
+        )
+        allocated = torch.cuda.memory_allocated(device) - before
+
+        assert measured == expected, (
+            f"state is {measured} bytes but the formula says {expected}; "
+            "the documented memory model has drifted from the fields"
+        )
+        # The caching allocator rounds up, so compare loosely against it.
+        assert allocated >= measured
+        assert allocated <= measured * 1.05 + 4096, (
+            f"allocator overhead {allocated - measured} bytes is larger than expected"
+        )
+
     def test_bad_dtype_is_rejected(self):
         with pytest.raises(ValueError, match="float32 or float64"):
             lbfgs_allocate_state(4, 1, dtype=torch.float16, device="cuda:0")

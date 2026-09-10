@@ -84,6 +84,20 @@ at ``E ~ -1e4 eV`` a float32 ULP is ``~1e-3 eV``, so a single-precision
 accumulator would make the line search a coin flip near convergence. The
 per-system arrays are ``O(num_systems)`` and the cost is negligible.
 
+Memory
+------
+The optimizer state costs, for ``P`` degrees of freedom, ``M`` systems and a
+history depth ``m``::
+
+    (2m + 3) * 3 * sizeof(dof) * P     per-DOF vectors and the s/y history
+  + (4m + 11) * 8 * M                  per-slot and per-system float64 scalars
+  +        6  * 4 * M                  per-system int32
+
+``positions`` is not included: it belongs to the caller. The history dominates,
+so ``m`` is the knob to turn if memory is tight; 3 to 7 is the usual range. At
+``m = 6`` with single-precision coordinates this is 180 bytes per degree of
+freedom, or 180 MB at a million.
+
 References
 ----------
 Nocedal, J. "Updating Quasi-Newton Matrices with Limited Storage."

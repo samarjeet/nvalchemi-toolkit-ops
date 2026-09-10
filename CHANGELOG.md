@@ -80,6 +80,9 @@
   view, so a copy would discard every update and leave the optimizer appearing
   not to move. Note that `torch.tensor` preserves NumPy strides, so an array
   built from a transpose is non-contiguous.
+- `benchmarks/dynamics/benchmark_lbfgs.py --gates` measures per-step optimizer
+  cost against FIRE2, the speed-up from CUDA-graph replay, and the model cost
+  above which L-BFGS wins end to end.
 - New `benchmarks/dynamics/benchmark_lbfgs.py`, comparing L-BFGS and FIRE2 by
   energy/force evaluations to convergence on Lennard-Jones clusters. FIRE2's
   timestep and step cap are swept per case and its best result reported, so the

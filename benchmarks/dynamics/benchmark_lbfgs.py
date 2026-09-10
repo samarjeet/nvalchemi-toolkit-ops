@@ -25,12 +25,17 @@ evaluate on the host and anharmonic enough to be a fair test. FIRE2's timestep
 and step cap are swept and its **best** configuration is reported, so the
 baseline is not handicapped by a poor choice of hyperparameters.
 
+Passing ``--gates`` instead measures the per-step cost commitments: optimizer
+time against FIRE2 at scale, what CUDA-graph replay recovers, and the model
+cost above which L-BFGS wins end to end.
+
 Usage
 -----
     python -m benchmarks.dynamics.benchmark_lbfgs [--sizes 13 32 55]
                                                   [--seeds 5]
                                                   [--force-tol 1e-4]
                                                   [--output-dir DIR]
+    python -m benchmarks.dynamics.benchmark_lbfgs --gates [--eval-ratio 0.21]
 """
 
 from __future__ import annotations
@@ -40,6 +45,7 @@ import csv
 import pathlib
 
 import numpy as np
+import torch
 import warp as wp
 
 from nvalchemiops.dynamics.optimizers import (
@@ -205,13 +211,160 @@ def best_fire2(start, force_tol):
     return best
 
 
+def _time_ms(fn, warmup=10, runs=50):
+    """Median-free mean over CUDA events, warmup excluded."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    wp.synchronize()
+    start, stop = torch.cuda.Event(True), torch.cuda.Event(True)
+    start.record()
+    for _ in range(runs):
+        fn()
+    stop.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(stop) / runs
+
+
+def run_gates(sizes, eval_ratio):
+    """Measure per-step cost, graph replay, and the break-even model cost.
+
+    Reported per system size:
+
+    ``eager`` / ``graph``
+        Optimizer-only time for one L-BFGS step, launched from Python and
+        replayed from a CUDA graph. The gap is Python launch overhead; the step
+        issues far more kernels than FIRE2, so at small sizes it is entirely
+        launch-bound.
+    ``fire2``
+        One FIRE2 step, for the same size, eager.
+    ``break-even``
+        Model cost per evaluation above which L-BFGS wins end to end, given the
+        evaluation-count advantage measured by the default benchmark. Negative
+        means it wins outright, because needing far fewer evaluations more than
+        pays for a costlier step.
+    """
+    from nvalchemiops.dynamics.optimizers import fire2_step
+    from nvalchemiops.torch.lbfgs import lbfgs_allocate_state, lbfgs_step_coord
+
+    print(
+        f"{'atoms':>9} {'eager ms':>9} {'graph ms':>9} {'fire2 ms':>9} "
+        f"{'eager/f2':>9} {'graph gain':>11} {'break-even':>12}"
+    )
+    rows = []
+    for num_atoms in sizes:
+        rng = np.random.default_rng(0)
+        positions = torch.tensor(
+            rng.normal(size=(num_atoms, 3)), dtype=torch.float64, device=DEVICE
+        )
+        forces = torch.zeros_like(positions)
+        energy = torch.zeros(1, dtype=torch.float64, device=DEVICE)
+        batch_idx = torch.zeros(num_atoms, dtype=torch.int32, device=DEVICE)
+        n_particles = torch.full((1,), num_atoms, dtype=torch.int32, device=DEVICE)
+        state = lbfgs_allocate_state(num_atoms, 1, dtype=torch.float64, device=DEVICE)
+        forces.copy_(-positions)
+        energy.copy_((0.5 * (positions**2).sum()).reshape(1))
+
+        def step():
+            lbfgs_step_coord(
+                positions,
+                state,
+                forces,
+                energy,
+                batch_idx,
+                n_particles,
+                force_tol=1e-12,
+                maxstep=0.5,
+            )
+
+        eager = _time_ms(step)
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                step()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        wp.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with wp.ScopedStream(wp.stream_from_torch(torch.cuda.current_stream())):
+            with torch.cuda.graph(graph):
+                step()
+        torch.cuda.synchronize()
+        graphed = _time_ms(graph.replay)
+
+        wp_positions = wp.array(
+            rng.normal(size=(num_atoms, 3)), dtype=wp.vec3d, device=DEVICE
+        )
+        wp_velocities = wp.zeros(num_atoms, dtype=wp.vec3d, device=DEVICE)
+        wp_forces = wp.zeros(num_atoms, dtype=wp.vec3d, device=DEVICE)
+        wp_batch = wp.zeros(num_atoms, dtype=wp.int32, device=DEVICE)
+        alpha = wp.array(np.array([0.09]), dtype=wp.float64, device=DEVICE)
+        dt = wp.array(np.array([0.02]), dtype=wp.float64, device=DEVICE)
+        nsteps_inc = wp.zeros(1, dtype=wp.int32, device=DEVICE)
+        scratch = [wp.zeros(1, dtype=wp.float64, device=DEVICE) for _ in range(4)]
+        fire2 = _time_ms(
+            lambda: fire2_step(
+                wp_positions,
+                wp_velocities,
+                wp_forces,
+                wp_batch,
+                alpha,
+                dt,
+                nsteps_inc,
+                *scratch,
+                maxstep=0.05,
+            )
+        )
+
+        # n_L (C + O_L) < n_F (C + O_F), with n_L / n_F = eval_ratio.
+        n_fire2 = 1000.0
+        n_lbfgs = eval_ratio * n_fire2
+        break_even_ms = (n_lbfgs * eager - n_fire2 * fire2) / (n_fire2 - n_lbfgs)
+        rows.append((num_atoms, eager, graphed, fire2, break_even_ms))
+        print(
+            f"{num_atoms:>9} {eager:>9.4f} {graphed:>9.4f} {fire2:>9.4f} "
+            f"{eager / fire2:>8.2f}x {eager / graphed:>10.1f}x "
+            f"{break_even_ms * 1000:>11.1f}us"
+        )
+
+    largest = rows[-1]
+    print(
+        f"\nper-step ratio at {largest[0]} atoms: {largest[1] / largest[3]:.2f}x FIRE2"
+    )
+    print(
+        "break-even model cost is negative wherever L-BFGS wins outright; any "
+        "realistic machine-learned potential costs far more than these figures."
+    )
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sizes", type=int, nargs="+", default=[13, 32, 55])
     parser.add_argument("--seeds", type=int, default=5)
     parser.add_argument("--force-tol", type=float, default=1e-4)
     parser.add_argument("--output-dir", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--gates",
+        action="store_true",
+        help="measure per-step cost, graph replay and break-even model cost",
+    )
+    parser.add_argument(
+        "--gate-sizes", type=int, nargs="+", default=[10_000, 100_000, 1_000_000]
+    )
+    parser.add_argument(
+        "--eval-ratio",
+        type=float,
+        default=0.21,
+        help="measured L-BFGS/FIRE2 evaluation ratio, used for the break-even cost",
+    )
     args = parser.parse_args()
+
+    if args.gates:
+        run_gates(args.gate_sizes, args.eval_ratio)
+        return
 
     rows = []
     print(
