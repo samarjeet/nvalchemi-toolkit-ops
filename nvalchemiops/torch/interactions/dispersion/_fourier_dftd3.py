@@ -693,6 +693,10 @@ class FourierD3Setup:
     mesh_dimensions: tuple[int, int, int]
     spline_order: int
 
+    def __post_init__(self):
+        """Reject mesh dimensions that cannot hold the interpolation stencil."""
+        _validate_mesh_dimensions(self.mesh_dimensions, self.spline_order)
+
     @classmethod
     def build(
         cls,
@@ -721,6 +725,7 @@ class FourierD3Setup:
         -------
         FourierD3Setup
         """
+        _validate_mesh_dimensions(mesh_dimensions, spline_order)
         cells = cell.reshape(-1, 3, 3)
         dtype, device = cells.dtype, cells.device
         mesh_nx, mesh_ny, mesh_nz = (int(n) for n in mesh_dimensions)
@@ -748,7 +753,17 @@ class FourierD3Setup:
         )
 
 
-def _resolve_mesh(mesh_dimensions, mesh_spacing, cells):
+def _validate_mesh_dimensions(mesh_dimensions, spline_order):
+    """Validate dimensions against the minimum supported by the spline stencil."""
+    minimum = max(spline_order, 3)
+    if len(mesh_dimensions) != 3 or any(int(n) < minimum for n in mesh_dimensions):
+        raise ValueError(
+            "mesh_dimensions must be three positive integers with each dimension at "
+            f"least max(spline_order, 3) = {minimum}, got {mesh_dimensions}."
+        )
+
+
+def _resolve_mesh(mesh_dimensions, mesh_spacing, cells, spline_order):
     """Settle the mesh size, requiring exactly one of the two ways of asking for it.
 
     Unlike PME there is no accuracy-based estimator to fall back on, so leaving both unset is
@@ -762,16 +777,15 @@ def _resolve_mesh(mesh_dimensions, mesh_spacing, cells):
             "accuracy-based default for FourierD3."
         )
     if mesh_dimensions is not None:
-        if len(mesh_dimensions) != 3 or any(int(n) < 1 for n in mesh_dimensions):
-            raise ValueError(
-                f"mesh_dimensions must be three positive integers, got {mesh_dimensions}."
-            )
+        _validate_mesh_dimensions(mesh_dimensions, spline_order)
         return tuple(int(n) for n in mesh_dimensions)
     if mesh_spacing <= 0.0:
         raise ValueError(f"mesh_spacing must be positive, got {mesh_spacing}.")
     lengths = torch.linalg.norm(cells, dim=-1).max(dim=0).values
+    minimum = max(spline_order, 3)
     return tuple(
-        max(1, int(torch.ceil(length / mesh_spacing).item())) for length in lengths
+        max(minimum, int(torch.ceil(length / mesh_spacing).item()))
+        for length in lengths
     )
 
 
@@ -1016,7 +1030,9 @@ def fourier_dftd3(
         mesh_nx, mesh_ny, mesh_nz = setup.mesh_dimensions
         spline_order = setup.spline_order
     else:
-        mesh_nx, mesh_ny, mesh_nz = _resolve_mesh(mesh_dimensions, mesh_spacing, cells)
+        mesh_nx, mesh_ny, mesh_nz = _resolve_mesh(
+            mesh_dimensions, mesh_spacing, cells, spline_order
+        )
     n_species, rank = params.n_species, params.rank
     n_channels = n_species * rank
 

@@ -174,6 +174,72 @@ def _dense_call(
 
 
 @pytest.mark.gpu
+class TestMeshSizing:
+    """Mesh sizing and validation at the public JAX binding."""
+
+    @pytest.mark.parametrize(
+        ("spline_order", "mesh_dimensions"),
+        [(2, (2, 3, 3)), (3, (2, 3, 3)), (5, (4, 5, 5)), (6, (5, 6, 6))],
+    )
+    def test_rejects_mesh_dimension_below_spline_floor(
+        self, device, system, spline_order, mesh_dimensions
+    ):
+        """Every mesh axis must fit the requested interpolation stencil."""
+        minimum = max(spline_order, 3)
+        with pytest.raises(
+            ValueError,
+            match=rf"at least max\(spline_order, 3\) = {minimum}",
+        ):
+            _evaluate(
+                system,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+            )
+
+    @pytest.mark.parametrize(
+        ("spline_order", "mesh_dimensions"),
+        [(2, (3, 4, 5)), (5, (5, 6, 7)), (6, (6, 7, 8))],
+    )
+    def test_accepts_floor_mesh_with_odd_and_even_axes(
+        self, device, system, spline_order, mesh_dimensions
+    ):
+        """Exact-bound meshes remain valid across odd and even axes."""
+        energy, forces = _evaluate(
+            system,
+            mesh_dimensions=mesh_dimensions,
+            spline_order=spline_order,
+        )
+        assert jnp.isfinite(energy).all()
+        assert jnp.isfinite(forces).all()
+
+    @pytest.mark.parametrize("spline_order", [2, 5, 6])
+    def test_coarse_spacing_is_clamped_to_spline_floor(
+        self, device, system, spline_order
+    ):
+        """Automatic sizing must apply the same lower bound as explicit sizing."""
+        minimum = max(spline_order, 3)
+        by_spacing = _evaluate(
+            system,
+            mesh_dimensions=None,
+            mesh_spacing=100.0,
+            spline_order=spline_order,
+        )
+        by_dimensions = _evaluate(
+            system,
+            mesh_dimensions=(minimum, minimum, minimum),
+            spline_order=spline_order,
+        )
+        np.testing.assert_allclose(
+            np.asarray(by_spacing[0]), np.asarray(by_dimensions[0]), rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            np.asarray(by_spacing[1]),
+            np.asarray(by_dimensions[1]),
+            atol=1e-11 * float(jnp.abs(by_dimensions[1]).max()),
+        )
+
+
+@pytest.mark.gpu
 class TestBatching:
     """Several systems in one call, with different cells.
 

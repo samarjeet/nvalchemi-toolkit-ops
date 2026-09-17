@@ -630,6 +630,70 @@ class TestMeshAndUnits:
             by_spacing[0].cpu().numpy(), by_dimensions[0].cpu().numpy(), rtol=1e-12
         )
 
+    @pytest.mark.parametrize(
+        ("spline_order", "mesh_dimensions"),
+        [(2, (2, 3, 3)), (3, (2, 3, 3)), (5, (4, 5, 5)), (6, (5, 6, 6))],
+    )
+    def test_rejects_mesh_dimension_below_spline_floor(
+        self, spline_order, mesh_dimensions
+    ):
+        """Every mesh axis must fit the requested interpolation stencil."""
+        system = _system("cuda:0")
+        minimum = max(spline_order, 3)
+        with pytest.raises(
+            ValueError,
+            match=rf"at least max\(spline_order, 3\) = {minimum}",
+        ):
+            _evaluate(
+                system,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+            )
+
+    @pytest.mark.parametrize("exact_moduli", [True, False])
+    @pytest.mark.parametrize(
+        ("spline_order", "mesh_dimensions"),
+        [(2, (3, 4, 5)), (5, (5, 6, 7)), (6, (6, 7, 8))],
+    )
+    def test_accepts_floor_mesh_for_both_moduli(
+        self, exact_moduli, spline_order, mesh_dimensions
+    ):
+        """Exact-bound meshes remain valid for both exposed modulus conventions."""
+        system = _system("cuda:0")
+        energy, forces = _evaluate(
+            system,
+            mesh_dimensions=mesh_dimensions,
+            spline_order=spline_order,
+            exact_moduli=exact_moduli,
+        )
+        assert torch.isfinite(energy).all()
+        assert torch.isfinite(forces).all()
+
+    @pytest.mark.parametrize("spline_order", [2, 5, 6])
+    def test_coarse_spacing_is_clamped_to_spline_floor(self, spline_order):
+        """Automatic sizing must apply the same lower bound as explicit sizing."""
+        system = _system("cuda:0")
+        minimum = max(spline_order, 3)
+        by_spacing = _evaluate(
+            system,
+            mesh_dimensions=None,
+            mesh_spacing=100.0,
+            spline_order=spline_order,
+        )
+        by_dimensions = _evaluate(
+            system,
+            mesh_dimensions=(minimum, minimum, minimum),
+            spline_order=spline_order,
+        )
+        np.testing.assert_allclose(
+            by_spacing[0].cpu().numpy(), by_dimensions[0].cpu().numpy(), rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            by_spacing[1].cpu().numpy(),
+            by_dimensions[1].cpu().numpy(),
+            atol=1e-11 * float(by_dimensions[1].abs().max()),
+        )
+
     def test_rejects_bad_mesh_arguments(self):
         """Degenerate mesh requests are rejected rather than clamped."""
         system = _system("cuda:0")
@@ -883,6 +947,14 @@ class TestTorchCompile:
 @pytest.mark.gpu
 class TestPrecomputedSetup:
     """Cell- and mesh-derived quantities reused across steps."""
+
+    def test_setup_rejects_mesh_dimension_below_spline_floor(self):
+        """Precomputed setups enforce the same mesh floor as the call-time API."""
+        system = _system("cuda:0")
+        with pytest.raises(ValueError, match=r"at least max\(spline_order, 3\) = 5"):
+            FourierD3Setup.build(
+                system["cell"], system["params"].n_species, (4, 5, 5), spline_order=5
+            )
 
     def test_matches_computing_them_inline(self):
         """Supplying the setup gives the same answer as letting the call derive it."""

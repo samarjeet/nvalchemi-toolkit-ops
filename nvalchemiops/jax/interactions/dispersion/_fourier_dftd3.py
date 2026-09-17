@@ -212,7 +212,17 @@ class FourierD3Parameters:
         )
 
 
-def _resolve_mesh(mesh_dimensions, mesh_spacing, cells):
+def _validate_mesh_dimensions(mesh_dimensions, spline_order):
+    """Validate dimensions against the minimum supported by the spline stencil."""
+    minimum = max(spline_order, 3)
+    if len(mesh_dimensions) != 3 or any(int(n) < minimum for n in mesh_dimensions):
+        raise ValueError(
+            "mesh_dimensions must be three positive integers with each dimension at "
+            f"least max(spline_order, 3) = {minimum}, got {mesh_dimensions}."
+        )
+
+
+def _resolve_mesh(mesh_dimensions, mesh_spacing, cells, spline_order):
     """Settle the mesh size, requiring exactly one of the two ways of asking for it."""
     if (mesh_dimensions is None) == (mesh_spacing is None):
         raise ValueError(
@@ -220,10 +230,7 @@ def _resolve_mesh(mesh_dimensions, mesh_spacing, cells):
             "accuracy-based default for FourierD3."
         )
     if mesh_dimensions is not None:
-        if len(mesh_dimensions) != 3 or any(int(n) < 1 for n in mesh_dimensions):
-            raise ValueError(
-                f"mesh_dimensions must be three positive integers, got {mesh_dimensions}."
-            )
+        _validate_mesh_dimensions(mesh_dimensions, spline_order)
         return tuple(int(n) for n in mesh_dimensions)
     if mesh_spacing <= 0.0:
         raise ValueError(f"mesh_spacing must be positive, got {mesh_spacing}.")
@@ -234,7 +241,10 @@ def _resolve_mesh(mesh_dimensions, mesh_spacing, cells):
             "mesh_spacing reads the cell lengths, which is not possible inside jax.jit. "
             "Pass mesh_dimensions explicitly when tracing."
         ) from None
-    return tuple(max(1, int(np.ceil(length / mesh_spacing))) for length in lengths)
+    minimum = max(spline_order, 3)
+    return tuple(
+        max(minimum, int(np.ceil(length / mesh_spacing))) for length in lengths
+    )
 
 
 def _reject_half_filled(
@@ -417,7 +427,9 @@ def fourier_dftd3(
         n_atoms,
     )
 
-    mesh_nx, mesh_ny, mesh_nz = _resolve_mesh(mesh_dimensions, mesh_spacing, cells)
+    mesh_nx, mesh_ny, mesh_nz = _resolve_mesh(
+        mesh_dimensions, mesh_spacing, cells, spline_order
+    )
     n_species, rank = params.n_species, params.rank
     n_groups = num_systems * n_species
 
