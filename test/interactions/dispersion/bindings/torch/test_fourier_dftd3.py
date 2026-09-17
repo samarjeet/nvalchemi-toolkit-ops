@@ -500,6 +500,87 @@ class TestFrozenReciprocalContraction:
         )
 
 
+@pytest.mark.gpu
+class TestRankChunking:
+    """Rank-chunked reciprocal passes preserve the public outputs."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_chunk_sizes_match_unchunked(self, dtype):
+        """Unit, non-dividing, equal and oversized chunks agree with the fast path."""
+        system = _system("cuda:0", dtype=dtype, n_atoms=8, seed=0)
+        rank = system["params"].rank
+        assert rank > 1
+        nondivisor = next((size for size in range(1, rank) if rank % size), rank - 1)
+        expected = _evaluate(system, compute_virial=True)
+        rtol, atol = (2e-5, 2e-6) if dtype == torch.float32 else (1e-9, 1e-10)
+        for chunk_size in (1, nondivisor, rank, rank + 1):
+            actual = _evaluate(
+                system,
+                compute_virial=True,
+                rank_chunk_size=chunk_size,
+            )
+            for got, want in zip(actual, expected, strict=True):
+                np.testing.assert_allclose(
+                    got.cpu().numpy(), want.cpu().numpy(), rtol=rtol, atol=atol
+                )
+
+    def test_chunked_path_supports_both_modulus_conventions(self):
+        """A non-dividing chunk remains valid with the PME modulus convention."""
+        system = _system("cuda:0", dtype=torch.float64, n_atoms=8, seed=0)
+        rank = system["params"].rank
+        assert rank > 1
+        chunk_size = next((size for size in range(1, rank) if rank % size), rank - 1)
+        for exact_moduli in (True, False):
+            expected = _evaluate(
+                system,
+                compute_virial=True,
+                exact_moduli=exact_moduli,
+            )
+            actual = _evaluate(
+                system,
+                compute_virial=True,
+                exact_moduli=exact_moduli,
+                rank_chunk_size=chunk_size,
+            )
+            for got, want in zip(actual, expected, strict=True):
+                np.testing.assert_allclose(
+                    got.cpu().numpy(), want.cpu().numpy(), rtol=1e-9, atol=1e-10
+                )
+
+    @pytest.mark.parametrize("invalid", [True, 0, -1, 1.5, torch.tensor(1)])
+    def test_rejects_invalid_chunk_sizes(self, invalid):
+        """Chunking is a positive host-static Python integer configuration."""
+        system = _system("cuda:0", n_atoms=4, seed=2)
+        with pytest.raises(ValueError, match="rank_chunk_size"):
+            _evaluate(system, rank_chunk_size=invalid)
+
+    def test_empty_system_is_zero_for_chunked_path(self):
+        """Empty inputs preserve output shapes and zero initialization."""
+        # Build a non-empty fixture first because the shared dense conversion helper does
+        # not represent an empty shift array; the public call below uses CSR with no edges.
+        system = _system("cuda:0", n_atoms=2, seed=2)
+        system["positions"] = torch.empty(
+            0, 3, dtype=system["positions"].dtype, device="cuda:0"
+        )
+        system["numbers"] = torch.empty(0, dtype=torch.int32, device="cuda:0")
+        system["neighbor_list"] = torch.empty(2, 0, dtype=torch.int32, device="cuda:0")
+        system["neighbor_ptr"] = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+        system["unit_shifts"] = torch.empty(0, 3, dtype=torch.int32, device="cuda:0")
+        rank = system["params"].rank
+        assert rank > 1
+        energy, forces, virial = _evaluate(
+            system,
+            compute_virial=True,
+            rank_chunk_size=rank - 1,
+        )
+        assert energy.shape == (1,)
+        assert forces.shape == (0, 3)
+        assert virial.shape == (1, 3, 3)
+        assert torch.count_nonzero(energy).item() == 0
+        assert torch.count_nonzero(forces).item() == 0
+        assert torch.count_nonzero(virial).item() == 0
+
+
 def _decomposition_view(parameters):
     """Adapt a parameter object back to what the NumPy harness expects."""
 
@@ -1119,6 +1200,37 @@ class TestTorchCompile:
         for _ in range(3):
             assert abs(float(compiled(system["positions"])[0]) - first) < 1e-12 * abs(
                 first
+            )
+
+    def test_chunked_nondivisible_remainder_compiles_fullgraph(self):
+        """A closed-over non-dividing chunk size remains one full Torch graph."""
+        system = _system("cuda:0", n_atoms=8, seed=0)
+        rank = system["params"].rank
+        nondivisor = next((size for size in range(1, rank) if rank % size), None)
+        assert nondivisor is not None
+
+        # Close over every input except the coordinate tensor, as an MD step would.
+        def compiled_evaluate(positions):
+            return fourier_dftd3(
+                positions,
+                system["numbers"],
+                fd3_params=system["params"],
+                cell=system["cell"],
+                r_cut=R_CUT,
+                mesh_dimensions=MESH,
+                neighbor_list=system["neighbor_list"],
+                neighbor_ptr=system["neighbor_ptr"],
+                unit_shifts=system["unit_shifts"],
+                compute_virial=True,
+                rank_chunk_size=nondivisor,
+                **DAMPING,
+            )
+
+        expected = compiled_evaluate(system["positions"])
+        actual = torch.compile(compiled_evaluate, fullgraph=True)(system["positions"])
+        for got, want in zip(actual, expected, strict=True):
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want.cpu().numpy(), rtol=1e-9, atol=1e-10
             )
 
 

@@ -598,6 +598,143 @@ def _fd3_epilogue_op(
         )
 
 
+@torch_custom_op(
+    "nvalchemiops::fourier_dftd3_gather",
+    mutates_args=("d_energy_d_c6", "forces"),
+)
+@_on_torch_stream
+def _fd3_gather_op(
+    potential: torch.Tensor,
+    positions: torch.Tensor,
+    c6: torch.Tensor,
+    group_idx: torch.Tensor,
+    cell_inv_t: torch.Tensor,
+    spline_order: int,
+    rank: int,
+    d_energy_d_c6: torch.Tensor,
+    forces: torch.Tensor,
+    device: str | None = None,
+) -> None:
+    """Internal op gathering one rank slice and its direct mesh force."""
+    d_energy_d_c6.zero_()
+    forces.zero_()
+    if positions.size(0) == 0:
+        return
+    if device is None:
+        device = str(positions.device)
+    wp_dtype, vec_dtype, mat_dtype = _dtypes(positions)
+    fd3_gather_and_force(
+        _wp(potential, wp_dtype),
+        _wp(positions.detach(), vec_dtype),
+        _wp(c6, wp_dtype),
+        _wp(group_idx, wp.int32),
+        _wp(cell_inv_t, mat_dtype),
+        spline_order,
+        rank,
+        _wp(d_energy_d_c6, wp_dtype),
+        _wp(forces, vec_dtype),
+        wp_dtype,
+        device,
+    )
+
+
+@torch_custom_op(
+    "nvalchemiops::fourier_dftd3_self_energy_and_cn",
+    mutates_args=("d_energy_d_c6", "d_energy_d_cn", "energy", "forces", "virial"),
+)
+@_on_torch_stream
+def _fd3_self_energy_and_cn_op(
+    c6: torch.Tensor,
+    dc6_dcn: torch.Tensor,
+    species_index: torch.Tensor,
+    batch_idx: torch.Tensor,
+    sqrt_q: torch.Tensor,
+    eigs: torch.Tensor,
+    s6: float,
+    s8: float,
+    a1: float,
+    a2: float,
+    positions: torch.Tensor,
+    numbers: torch.Tensor,
+    cartesian_shifts: torch.Tensor,
+    rcov: torch.Tensor,
+    r_cut: float,
+    d_energy_d_c6: torch.Tensor,
+    d_energy_d_cn: torch.Tensor,
+    energy: torch.Tensor,
+    forces: torch.Tensor,
+    virial: torch.Tensor,
+    neighbor_list: torch.Tensor | None = None,
+    neighbor_ptr: torch.Tensor | None = None,
+    neighbor_matrix: torch.Tensor | None = None,
+    fill_value: int | None = None,
+    compute_virial: bool = False,
+    device: str | None = None,
+) -> None:
+    """Internal op applying full-rank self-energy and CN propagation once."""
+    d_energy_d_cn.zero_()
+    if positions.size(0) == 0:
+        return
+    if device is None:
+        device = str(positions.device)
+    wp_dtype, vec_dtype, mat_dtype = _dtypes(positions)
+
+    fd3_self_energy(
+        _wp(c6, wp_dtype),
+        _wp(species_index, wp.int32),
+        _wp(batch_idx, wp.int32),
+        _wp(sqrt_q, wp_dtype),
+        _wp(eigs, wp_dtype),
+        s6,
+        s8,
+        a1,
+        a2,
+        _wp(energy, wp_dtype),
+        _wp(d_energy_d_c6, wp_dtype),
+        wp_dtype,
+        device,
+    )
+
+    if neighbor_matrix is not None:
+        fd3_cn_chain_matrix(
+            _wp(d_energy_d_c6, wp_dtype),
+            _wp(dc6_dcn, wp_dtype),
+            _wp(positions.detach(), vec_dtype),
+            _wp(numbers, wp.int32),
+            _wp(neighbor_matrix, wp.int32),
+            _wp(cartesian_shifts, vec_dtype),
+            _wp(rcov, wp_dtype),
+            r_cut,
+            _wp(batch_idx, wp.int32),
+            _wp(d_energy_d_cn, wp_dtype),
+            _wp(forces, vec_dtype),
+            _wp(virial, mat_dtype),
+            wp_dtype,
+            device,
+            compute_virial,
+            fill_value,
+        )
+    else:
+        fd3_cn_chain(
+            _wp(d_energy_d_c6, wp_dtype),
+            _wp(dc6_dcn, wp_dtype),
+            _wp(positions.detach(), vec_dtype),
+            _wp(numbers, wp.int32),
+            _wp(neighbor_list, wp.int32),
+            _wp(neighbor_ptr, wp.int32),
+            _wp(cartesian_shifts, vec_dtype),
+            _wp(rcov, wp_dtype),
+            r_cut,
+            _wp(batch_idx, wp.int32),
+            _wp(d_energy_d_cn, wp_dtype),
+            _wp(forces, vec_dtype),
+            _wp(virial, mat_dtype),
+            wp_dtype,
+            device,
+            compute_virial,
+        )
+
+
 def _bspline_moduli(miller, mesh_size, spline_order, exact, dtype, device):
     """B-spline attenuation for one mesh axis.
 
@@ -859,6 +996,187 @@ def _pairing_residual(sources, targets, shifts):
     return balance + drift
 
 
+def _validate_rank_chunk_size(rank_chunk_size: int | None) -> None:
+    """Validate the host-static rank chunk configuration."""
+    if rank_chunk_size is None:
+        return
+    if isinstance(rank_chunk_size, bool) or not isinstance(rank_chunk_size, int):
+        raise ValueError(
+            "rank_chunk_size must be a positive Python integer or None, got "
+            f"{type(rank_chunk_size).__name__}."
+        )
+    if rank_chunk_size <= 0:
+        raise ValueError(
+            f"rank_chunk_size must be a positive integer or None, got {rank_chunk_size}."
+        )
+
+
+def _fd3_chunked_pipeline(
+    positions: torch.Tensor,
+    numbers: torch.Tensor,
+    species_index: torch.Tensor,
+    group_idx: torch.Tensor,
+    batch_idx: torch.Tensor,
+    cell_inv_grouped: torch.Tensor,
+    c6: torch.Tensor,
+    dc6_dcn: torch.Tensor,
+    cartesian_shifts: torch.Tensor,
+    rcov: torch.Tensor,
+    sqrt_q: torch.Tensor,
+    eigs: torch.Tensor,
+    r_cut: float,
+    s6: float,
+    s8: float,
+    a1: float,
+    a2: float,
+    mesh_nx: int,
+    mesh_ny: int,
+    mesh_nz: int,
+    n_species: int,
+    rank: int,
+    rank_chunk_size: int,
+    spline_order: int,
+    num_systems: int,
+    k_matrix: torch.Tensor,
+    moduli_x: torch.Tensor,
+    moduli_y: torch.Tensor,
+    moduli_z: torch.Tensor,
+    volumes: torch.Tensor,
+    neighbor_list: torch.Tensor | None,
+    neighbor_ptr: torch.Tensor | None,
+    neighbor_matrix: torch.Tensor | None,
+    fill_value: int | None,
+    compute_virial: bool,
+    device: str | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Evaluate reciprocal and gathered passes in fixed contiguous rank slices."""
+    empty = dict(dtype=positions.dtype, device=positions.device)
+    reciprocal_energy = torch.zeros(num_systems, **empty)
+    reciprocal_virial = torch.zeros(num_systems, 3, 3, **empty)
+    direct_forces = torch.zeros(positions.size(0), 3, **empty)
+    d_energy_d_c6_slices = []
+
+    idx_j = (
+        neighbor_list[1].contiguous().to(torch.int32)
+        if neighbor_list is not None
+        else None
+    )
+    ptr = neighbor_ptr.to(torch.int32) if neighbor_ptr is not None else None
+    matrix = neighbor_matrix.to(torch.int32) if neighbor_matrix is not None else None
+
+    for start in range(0, rank, rank_chunk_size):
+        stop = min(start + rank_chunk_size, rank)
+        chunk_rank = stop - start
+        c6_chunk = c6[:, start:stop].contiguous()
+        eigs_chunk = eigs[start:stop].contiguous()
+
+        mesh = torch.zeros(
+            num_systems * n_species * chunk_rank,
+            mesh_nx,
+            mesh_ny,
+            mesh_nz,
+            **empty,
+        )
+        _fd3_spread_op(
+            positions,
+            c6_chunk,
+            group_idx,
+            cell_inv_grouped,
+            spline_order,
+            chunk_rank,
+            mesh,
+            device,
+        )
+        mesh_fft = torch.fft.rfftn(mesh, dim=(-3, -2, -1), norm="backward")
+        mesh_fft_pairs = torch.view_as_real(mesh_fft.resolve_conj()).contiguous()
+
+        chunk_energy = torch.zeros(num_systems, **empty)
+        chunk_virial = torch.zeros(num_systems, 3, 3, **empty)
+        cotangent = torch.zeros_like(mesh_fft_pairs)
+        _fd3_kspace_op(
+            mesh_fft_pairs,
+            k_matrix,
+            moduli_x,
+            moduli_y,
+            moduli_z,
+            volumes,
+            sqrt_q,
+            eigs_chunk,
+            s6,
+            s8,
+            a1,
+            a2,
+            mesh_nx,
+            mesh_ny,
+            mesh_nz,
+            n_species,
+            chunk_rank,
+            chunk_energy,
+            cotangent,
+            chunk_virial,
+            compute_virial,
+            device,
+        )
+        potential = torch.fft.irfftn(
+            torch.view_as_complex(cotangent),
+            s=(mesh_nx, mesh_ny, mesh_nz),
+            dim=(-3, -2, -1),
+            norm="forward",
+        ).contiguous()
+
+        d_energy_d_c6_chunk = torch.zeros(positions.size(0), chunk_rank, **empty)
+        chunk_forces = torch.zeros(positions.size(0), 3, **empty)
+        _fd3_gather_op(
+            potential,
+            positions,
+            c6_chunk,
+            group_idx,
+            cell_inv_grouped,
+            spline_order,
+            chunk_rank,
+            d_energy_d_c6_chunk,
+            chunk_forces,
+            device,
+        )
+
+        reciprocal_energy.add_(chunk_energy)
+        reciprocal_virial.add_(chunk_virial)
+        direct_forces.add_(chunk_forces)
+        d_energy_d_c6_slices.append(d_energy_d_c6_chunk)
+
+    d_energy_d_c6 = torch.cat(d_energy_d_c6_slices, dim=1)
+    d_energy_d_cn = torch.zeros(positions.size(0), **empty)
+    _fd3_self_energy_and_cn_op(
+        c6,
+        dc6_dcn,
+        species_index,
+        batch_idx,
+        sqrt_q,
+        eigs,
+        s6,
+        s8,
+        a1,
+        a2,
+        positions,
+        numbers,
+        cartesian_shifts,
+        rcov,
+        r_cut,
+        d_energy_d_c6,
+        d_energy_d_cn,
+        reciprocal_energy,
+        direct_forces,
+        reciprocal_virial,
+        idx_j,
+        ptr,
+        matrix,
+        fill_value,
+        compute_virial,
+        device,
+    )
+    return reciprocal_energy, direct_forces, reciprocal_virial
+
+
 def fourier_dftd3(
     positions: torch.Tensor,
     numbers: torch.Tensor,
@@ -883,6 +1201,7 @@ def fourier_dftd3(
     compute_virial: bool = False,
     num_systems: int | None = None,
     exact_moduli: bool = True,
+    rank_chunk_size: int | None = None,
     setup: FourierD3Setup | None = None,
     device: str | None = None,
 ) -> tuple[torch.Tensor, ...]:
@@ -949,6 +1268,10 @@ def fourier_dftd3(
         Measured against an independent implementation of this method, the discrete form
         agrees to machine precision while the continuous one leaves a force discrepancy
         around 1e-5 at a 48-cubed mesh. Set to False only to reproduce the PME convention.
+    rank_chunk_size : int, optional
+        Number of retained coefficient-rank columns to process per reciprocal-space pass.
+        ``None`` and values at least as large as the retained rank use the unchunked path.
+        This is host-static configuration and must be a positive Python integer when set.
     device : str, optional
         Warp device string. Inferred from ``positions`` when omitted.
 
@@ -986,6 +1309,7 @@ def fourier_dftd3(
         raise ValueError("cell is required: FourierD3 evaluates a periodic sum.")
     if spline_order < 2 or spline_order > 6:
         raise ValueError(f"spline_order must be between 2 and 6, got {spline_order}.")
+    _validate_rank_chunk_size(rank_chunk_size)
 
     positions = positions if positions.is_floating_point() else positions.double()
     cells = cell.reshape(-1, 3, 3).to(dtype=positions.dtype, device=positions.device)
@@ -1109,6 +1433,49 @@ def fourier_dftd3(
         fill_value,
         device,
     )
+
+    if rank_chunk_size is not None and rank_chunk_size < rank:
+        chunked_energy, chunked_forces, chunked_virial = _fd3_chunked_pipeline(
+            positions,
+            numbers.to(torch.int32),
+            species_index,
+            group_idx,
+            batch_idx,
+            cell_inv_grouped,
+            c6,
+            dc6_dcn,
+            cartesian_shifts,
+            params.rcov,
+            params.sqrt_q,
+            params.eigs,
+            r_cut,
+            s6,
+            s8,
+            a1,
+            a2,
+            mesh_nx,
+            mesh_ny,
+            mesh_nz,
+            n_species,
+            rank,
+            rank_chunk_size,
+            spline_order,
+            num_systems,
+            setup.k_matrix,
+            setup.moduli_x,
+            setup.moduli_y,
+            setup.moduli_z,
+            setup.volumes,
+            neighbor_list,
+            neighbor_ptr,
+            neighbor_matrix,
+            fill_value,
+            compute_virial,
+            device,
+        )
+        if compute_virial:
+            return chunked_energy, chunked_forces, chunked_virial
+        return chunked_energy, chunked_forces
 
     mesh = torch.zeros(num_systems * n_channels, mesh_nx, mesh_ny, mesh_nz, **empty)
     _fd3_spread_op(
