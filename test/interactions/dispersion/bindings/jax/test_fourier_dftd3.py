@@ -41,6 +41,10 @@ from test.interactions.dispersion.test_fourier_dftd3 import (  # noqa: E402
 DAMPING = dict(a1=0.4289, a2=4.4407, s8=0.7875, s6=1.0)
 R_CUT = 4.0
 MESH = (32, 32, 32)
+TRICLINIC_CELL = np.array(
+    [[9.0, 0.0, 0.0], [1.7, 8.4, 0.0], [-0.8, 1.1, 8.7]],
+    dtype=np.float64,
+)
 
 
 @pytest.fixture()
@@ -300,6 +304,91 @@ class TestAgreementWithWarpLayer:
         virial = np.asarray(virial)[0]
         assert np.abs(virial).max() > 0.0
         np.testing.assert_allclose(virial, virial.T, atol=1e-12 * np.abs(virial).max())
+
+    def test_triclinic_forces_match_finite_differences(self, device, system):
+        """Cartesian forces remain the negative energy gradient in a triclinic cell."""
+        raw = system["numpy"]
+        rng = np.random.default_rng(3)
+        positions = rng.uniform(0.1, 0.9, raw["positions"].shape) @ TRICLINIC_CELL
+        targets, pointer, shifts, _ = _neighbour_list(positions, TRICLINIC_CELL, R_CUT)
+        triclinic = {
+            **system,
+            "positions": jnp.asarray(positions),
+            "cell": jnp.asarray(TRICLINIC_CELL),
+            "neighbor_list": jnp.asarray(
+                np.stack(
+                    [np.repeat(np.arange(raw["n_atoms"]), np.diff(pointer)), targets]
+                ),
+                dtype=jnp.int32,
+            ),
+            "neighbor_ptr": jnp.asarray(pointer, dtype=jnp.int32),
+            "unit_shifts": jnp.asarray(shifts, dtype=jnp.int32),
+        }
+        analytic = np.asarray(_evaluate(triclinic)[1])
+
+        step = 1e-5
+        base = triclinic["positions"]
+        numerical = np.zeros_like(analytic)
+        for atom in range(base.shape[0]):
+            for axis in range(3):
+                for sign in (1.0, -1.0):
+                    moved = base.at[atom, axis].add(sign * step)
+                    energy = _evaluate({**triclinic, "positions": moved})[0]
+                    numerical[atom, axis] -= sign * float(energy[0]) / (2.0 * step)
+        np.testing.assert_allclose(analytic, numerical, rtol=1e-6, atol=1e-8)
+
+    def test_triclinic_virial_matches_six_strain_derivatives(self, device, system):
+        """The six independent virial components match triclinic strain differences."""
+        raw = system["numpy"]
+        rng = np.random.default_rng(3)
+        positions = rng.uniform(0.1, 0.9, raw["positions"].shape) @ TRICLINIC_CELL
+        targets, pointer, shifts, _ = _neighbour_list(positions, TRICLINIC_CELL, R_CUT)
+        triclinic = {
+            **system,
+            "positions": jnp.asarray(positions),
+            "cell": jnp.asarray(TRICLINIC_CELL),
+            "neighbor_list": jnp.asarray(
+                np.stack(
+                    [np.repeat(np.arange(raw["n_atoms"]), np.diff(pointer)), targets]
+                ),
+                dtype=jnp.int32,
+            ),
+            "neighbor_ptr": jnp.asarray(pointer, dtype=jnp.int32),
+            "unit_shifts": jnp.asarray(shifts, dtype=jnp.int32),
+        }
+        analytic = np.asarray(_evaluate(triclinic, compute_virial=True)[2])[0]
+
+        step = 1e-6
+        base_positions = triclinic["positions"]
+        base_cell = triclinic["cell"]
+        components = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
+        numerical = np.zeros(len(components))
+        for index, (row, column) in enumerate(components):
+            energies = []
+            for sign in (1.0, -1.0):
+                strain = (
+                    jnp.zeros((3, 3), dtype=base_cell.dtype)
+                    .at[row, column]
+                    .set(sign * step)
+                )
+                deformation = jnp.eye(3, dtype=base_cell.dtype) + strain
+                energy = _evaluate(
+                    {
+                        **triclinic,
+                        "positions": base_positions @ deformation.T,
+                        "cell": base_cell @ deformation.T,
+                    }
+                )[0]
+                energies.append(float(energy[0]))
+            numerical[index] = (energies[0] - energies[1]) / (2.0 * step)
+        np.testing.assert_allclose(
+            analytic[
+                [row for row, _ in components], [column for _, column in components]
+            ],
+            numerical,
+            rtol=1e-6,
+            atol=1e-8,
+        )
 
 
 @pytest.mark.gpu

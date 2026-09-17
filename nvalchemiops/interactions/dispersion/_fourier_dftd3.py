@@ -1386,7 +1386,7 @@ def _fd3_gather_and_force_kernel(
         gz = wrap_grid_index(base_grid[2] + offset[2], mesh_dims[2])
 
         # Fractional-space gradients become Cartesian through the inverse cell.
-        cartesian = cell_inv_t[group] * gradient
+        cartesian = wp.transpose(cell_inv_t[group]) * gradient
 
         for slot in range(rank):
             value = potential[group * rank + slot, gx, gy, gz]

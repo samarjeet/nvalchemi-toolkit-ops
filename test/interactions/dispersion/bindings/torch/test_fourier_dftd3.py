@@ -46,9 +46,13 @@ from test.interactions.dispersion.test_fourier_dftd3 import (  # noqa: E402
 DAMPING = dict(a1=0.4289, a2=4.4407, s8=0.7875, s6=1.0)
 R_CUT = 4.0
 MESH = (32, 32, 32)
+TRICLINIC_CELL = np.array(
+    [[9.0, 0.0, 0.0], [1.7, 8.4, 0.0], [-0.8, 1.1, 8.7]],
+    dtype=np.float64,
+)
 
 
-def _system(device, dtype=None, n_atoms=8, box=9.0, seed=0):
+def _system(device, dtype=None, n_atoms=8, box=9.0, seed=0, cell=None):
     """A small periodic cell with its neighbour list in both formats.
 
     ``dtype`` defaults to ``torch.float64``, resolved on the call rather than written into
@@ -65,9 +69,13 @@ def _system(device, dtype=None, n_atoms=8, box=9.0, seed=0):
     r4r2 = np.zeros(max_z)
     r4r2[[1, 6, 8]] = [1.0, 1.4, 1.2]
 
-    positions = rng.uniform(0.0, box, (n_atoms, 3))
+    if cell is None:
+        cell = np.eye(3) * box
+        positions = rng.uniform(0.0, box, (n_atoms, 3))
+    else:
+        cell = np.asarray(cell, dtype=np.float64)
+        positions = rng.uniform(0.1, 0.9, (n_atoms, 3)) @ cell
     numbers = rng.choice(species, n_atoms)
-    cell = np.eye(3) * box
     targets, pointer, shifts, _ = _neighbour_list(positions, cell, R_CUT)
     sources = np.repeat(np.arange(n_atoms), np.diff(pointer))
 
@@ -311,6 +319,58 @@ class TestAgreementWithWarpLayer:
         system["positions"], system["cell"] = base_positions, base_cell
         np.testing.assert_allclose(
             analytic, numerical, atol=1e-6 * np.abs(numerical).max()
+        )
+
+    def test_triclinic_forces_match_finite_differences(self):
+        """Cartesian forces remain the negative energy gradient in a triclinic cell."""
+        device = "cuda:0"
+        system = _system(device, n_atoms=6, seed=3, cell=TRICLINIC_CELL)
+        analytic = _evaluate(system)[1].cpu().numpy()
+
+        step = 1e-5
+        base = system["positions"].clone()
+        numerical = np.zeros_like(analytic)
+        for atom in range(system["n_atoms"]):
+            for axis in range(3):
+                for sign in (1.0, -1.0):
+                    system["positions"] = base.clone()
+                    system["positions"][atom, axis] += sign * step
+                    energy = _evaluate(system)[0]
+                    numerical[atom, axis] -= sign * float(energy) / (2.0 * step)
+        system["positions"] = base
+        np.testing.assert_allclose(analytic, numerical, rtol=1e-6, atol=1e-8)
+
+    def test_triclinic_virial_matches_six_strain_derivatives(self):
+        """The six independent virial components match triclinic strain differences."""
+        device = "cuda:0"
+        system = _system(device, n_atoms=6, seed=3, cell=TRICLINIC_CELL)
+        analytic = _evaluate(system, compute_virial=True)[2][0].cpu().numpy()
+
+        step = 1e-6
+        base_positions = system["positions"].clone()
+        base_cell = system["cell"].clone()
+        components = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
+        numerical = np.zeros(len(components))
+        for index, (row, column) in enumerate(components):
+            energies = []
+            for sign in (1.0, -1.0):
+                strain = torch.zeros(3, 3, dtype=base_cell.dtype, device=device)
+                strain[row, column] = sign * step
+                deformation = (
+                    torch.eye(3, dtype=base_cell.dtype, device=device) + strain
+                )
+                system["positions"] = base_positions @ deformation.T
+                system["cell"] = base_cell @ deformation.T
+                energies.append(float(_evaluate(system)[0]))
+            numerical[index] = (energies[0] - energies[1]) / (2.0 * step)
+        system["positions"], system["cell"] = base_positions, base_cell
+        np.testing.assert_allclose(
+            analytic[
+                [row for row, _ in components], [column for _, column in components]
+            ],
+            numerical,
+            rtol=1e-6,
+            atol=1e-8,
         )
 
 
