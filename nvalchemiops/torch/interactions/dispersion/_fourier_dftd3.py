@@ -1248,9 +1248,10 @@ def fourier_dftd3(
     mesh_dimensions : tuple[int, int, int], optional
         Mesh size. Exactly one of this and ``mesh_spacing`` must be given.
     mesh_spacing : float, optional
-        Target spacing, in the same unit as ``cell``. Sized from the largest cell in a batch.
-        Reads cell lengths into Python integers, so pass explicit ``mesh_dimensions`` when
-        tracing.
+        Maximum spacing, in the same unit as ``cell``. Each dimension is sized from the
+        largest cell in a batch and rounded upward to the next value factorizable by 2, 3,
+        5, and 7. Reads cell lengths into Python integers, so pass explicit
+        ``mesh_dimensions`` when tracing.
     neighbor_matrix, neighbor_matrix_shifts : torch.Tensor, optional
         Dense padded neighbour indices and their lattice images.
     neighbor_list, neighbor_ptr, unit_shifts : torch.Tensor, optional
@@ -1266,11 +1267,8 @@ def fourier_dftd3(
     s6 : float, default=1.0
         Sixth-order scaling; unity for every common parametrisation.
     spline_order : int, default=4
-        B-spline interpolation order, from 2 to 6. Accuracy at a fixed mesh improves with
-        order: measured against a converged reference, orders 2 to 5 land roughly three
-        orders of magnitude apart each way, so raising the order buys more than refining the
-        mesh does. Order 3 is noticeably noisier than its neighbours; prefer an even order
-        unless you have measured otherwise.
+        B-spline interpolation order, from 2 to 6. Every mesh dimension must be at least
+        ``max(spline_order, 3)``.
     batch_idx : torch.Tensor, shape (N,), optional
         System index per atom. Atoms must be grouped by system.
     compute_virial : bool, default=False
@@ -1279,11 +1277,8 @@ def fourier_dftd3(
         Number of systems, inferred from ``cell`` when omitted.
     exact_moduli : bool, default=True
         Use the discrete B-spline modulus rather than ``sinc(m/N)**p``. The discrete form is
-        what interpolation on a finite mesh actually applies; ``sinc(m/N)**p`` is its
-        continuous approximation, which the electrostatics PME path in this package uses.
-        Measured against an independent implementation of this method, the discrete form
-        agrees to machine precision while the continuous one leaves a force discrepancy
-        around 1e-5 at a 48-cubed mesh. Set to False only to reproduce the PME convention.
+        what interpolation on a finite mesh applies; ``sinc(m/N)**p`` is the continuous
+        convention also used by the electrostatics PME path in this package.
     rank_chunk_size : int, optional
         Number of retained coefficient-rank columns to process per reciprocal-space pass.
         ``None`` and values at least as large as the retained rank use the unchunked path.

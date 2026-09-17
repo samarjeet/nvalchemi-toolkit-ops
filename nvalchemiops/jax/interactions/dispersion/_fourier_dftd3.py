@@ -383,8 +383,9 @@ def fourier_dftd3(
         Coordination-number cutoff, in the same length unit as ``positions``. Must equal the
         radius the neighbour list was built with.
     mesh_dimensions, mesh_spacing
-        Exactly one is required. ``mesh_spacing`` reads cell lengths and so cannot be used
-        inside ``jax.jit``.
+        Exactly one is required. ``mesh_spacing`` is a maximum spacing: each inferred
+        dimension is rounded upward to the next value factorizable by 2, 3, 5, and 7.
+        It reads cell lengths and so cannot be used inside ``jax.jit``.
     neighbor_matrix, neighbor_matrix_shifts, neighbor_list, neighbor_ptr, unit_shifts
         Exactly one neighbour format, with its matching lattice images.
 
@@ -398,11 +399,8 @@ def fourier_dftd3(
     s6 : float, default=1.0
         Sixth-order scaling.
     spline_order : int, default=4
-        B-spline interpolation order, from 2 to 6. Accuracy at a fixed mesh improves with
-        order: measured against a converged reference, orders 2 to 5 land roughly three
-        orders of magnitude apart each way, so raising the order buys more than refining the
-        mesh does. Order 3 is noticeably noisier than its neighbours; prefer an even order
-        unless you have measured otherwise.
+        B-spline interpolation order, from 2 to 6. Every mesh dimension must be at least
+        ``max(spline_order, 3)``.
     batch_idx : jax.Array, shape (N,), optional
         System index per atom.
     compute_virial : bool, default=False

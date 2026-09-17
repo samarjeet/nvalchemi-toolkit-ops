@@ -179,6 +179,7 @@ print(f"directed edges   : {len(sources)}")
 # compilable; ``jax.grad`` of the energy is therefore not the route to forces here.
 
 damping = dict(a1=0.4289, a2=4.4407, s8=0.7875)  # PBE-D3(BJ)
+rank_chunk_size = None  # Set a positive Python integer to bound reciprocal workspace.
 common = dict(
     fd3_params=params,
     cell=cell,
@@ -187,6 +188,8 @@ common = dict(
     neighbor_list=neighbor_list,
     neighbor_ptr=neighbor_ptr,
     unit_shifts=unit_shifts,
+    exact_moduli=True,
+    rank_chunk_size=rank_chunk_size,
 )
 
 energy, forces, virial = fourier_dftd3(
@@ -202,10 +205,10 @@ print(f"virial trace : {float(jnp.trace(virial[0])):.6e} Hartree")
 # Compiling the call
 # ------------------
 #
-# Everything that changes the shape of the work --- the damping constants, ``r_cut``, the mesh
-# and the spline order --- has to be static, because the Warp kernels are specialised on them.
-# The arrays stay traced, so a compiled step can be reused across a trajectory as long as the
-# neighbour list keeps its length.
+# Everything that changes the shape of the work --- the damping constants, ``r_cut``, the mesh,
+# spline order, modulus convention, and rank chunk size --- has to be static because the Warp
+# kernels are specialised on those values. The arrays stay traced, so a compiled step can be
+# reused across a trajectory as long as the neighbour list keeps its length.
 
 jitted = jax.jit(
     lambda pos, num, nl, ptr, sh: fourier_dftd3(
@@ -219,6 +222,8 @@ jitted = jax.jit(
         neighbor_list=nl,
         neighbor_ptr=ptr,
         unit_shifts=sh,
+        exact_moduli=True,
+        rank_chunk_size=rank_chunk_size,
     )
 )
 
@@ -232,34 +237,6 @@ print(f"compiled energy : {float(compiled_energy[0]):.12f} Hartree")
 print(f"force agreement : {float(jnp.abs(compiled_forces - forces).max()):.2e}")
 
 # %%
-# Mesh convergence
-# ----------------
-#
-# The mesh is the only accuracy knob on the dispersion sum. Refining it converges the energy;
-# there is no cutoff to enlarge, and no neighbour list that grows while you do it.
-
-print("\n mesh      energy (Hartree)      change")
-previous = None
-for size in (16, 24, 32, 48):
-    value = float(
-        fourier_dftd3(
-            positions,
-            numbers,
-            **damping,
-            fd3_params=params,
-            cell=cell,
-            r_cut=r_cut,
-            mesh_dimensions=(size, size, size),
-            neighbor_list=neighbor_list,
-            neighbor_ptr=neighbor_ptr,
-            unit_shifts=unit_shifts,
-        )[0][0]
-    )
-    change = "" if previous is None else f"{abs(value - previous) / abs(value):.2e}"
-    print(f" {size:3d}^3    {value:+.12f}    {change:>9}")
-    previous = value
-
-# %%
 # Summary
 # -------
 #
@@ -269,6 +246,8 @@ for size in (16, 24, 32, 48):
 #   ``r_cut``, and takes exactly one of ``mesh_dimensions`` or ``mesh_spacing``.
 # - Under ``jax.jit`` the shape-determining arguments must be static; the arrays stay traced,
 #   so one compiled step serves a whole trajectory at fixed neighbour-list length.
+# - Mesh, spline, modulus, decomposition, dtype, and rank-chunk controls are explicit; this
+#   example does not select or recommend calibrated values for another application.
 # - Forces and the virial are returned directly rather than obtained by differentiation.
 #
 # For open boundary conditions, or for small systems where the truncation error does not

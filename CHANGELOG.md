@@ -8,10 +8,7 @@
   `dftd3` sums pair interactions in real space, `fourier_dftd3` evaluates the same
   correction on a mesh in `O(N log N)` with **no real-space cutoff on the dispersion
   sum**; the only real-space cutoff remaining is the short coordination-number list a
-  machine-learned force field already builds. This matters because a `1/r^6` interaction
-  summed over three dimensions leaves a truncation error decaying only as `1/r^3`, so
-  converging the real-space form to sub-meV/atom requires cutoffs at which the neighbour
-  list dominates the simulation step. Available as
+  machine-learned force field already builds. Available as
   `nvalchemiops.interactions.dispersion._fourier_dftd3` (Warp component launchers), and
   as `fourier_dftd3` in both the Torch and JAX dispersion modules. Energy, forces and
   the virial are supported, in float32 and float64, batched, with either neighbour
@@ -41,21 +38,27 @@
 
 - `FourierD3Setup` in the Torch dispersion module, holding the cell- and mesh-derived
   quantities that do not change between steps. Passing it to `fourier_dftd3` skips a
-  matrix inversion and a set of spline moduli per call, worth 3.1x at 8,000 atoms, and is
-  required for
+  matrix inversion and a set of spline moduli per call, and is required for
   `torch.compile(mode="reduce-overhead")` because `torch.linalg.inv` cannot be recorded
   into a CUDA graph. Warp launches are now bound to PyTorch's current stream without an
   entry synchronisation, which graph capture also forbids.
+- Torch and JAX FourierD3 expose the same mesh, spline, decomposition, dtype, modulus,
+  and rank-chunk controls. Automatically sized meshes treat `mesh_spacing` as a maximum
+  and round upward to dimensions factorizable by 2, 3, 5, and 7. Smaller
+  `rank_chunk_size` values bound reciprocal workspace by processing retained ranks in
+  multiple FFT passes.
+
+### Changed
+
+- FourierD3's JAX kernels require Warp 1.16 or newer for explicit JAX launch block
+  dimensions.
 
 ### Notes
 
 - FourierD3 uses a modified coordination-number function that decays to zero at the
   neighbour list cutoff, where the standard D3 function tends to a non-zero constant.
   That modification is what makes the coordination numbers independent of the list used
-  to build them, so the two functions are not identical; in practice the difference is
-  small. On diamond with the published tables, FourierD3 agrees to 5.9e-06 relative with
-  `dftd3` extrapolated to an infinite cutoff, while reading only a 6 Angstrom list, where
-  `dftd3` at that same cutoff is still 10% short.
+  to build them, so the two functions are not identical.
 - `rcov` follows the same convention as `dftd3`: the shipped table already folds in
   Grimme's 4/3 scale, so the counting function crosses one half at a separation equal to
   the sum of the two tabulated radii. Pass `dftd3` and `fourier_dftd3` the same table.
@@ -72,6 +75,11 @@
   the reciprocal vectors' dependence on the current cell.
 
 ### Fixed
+
+- Corrected FourierD3's fractional-to-Cartesian mesh-gradient conversion for triclinic
+  cells, restoring Cartesian force and strain-derivative consistency in Torch and JAX.
+- FourierD3 now rejects explicit mesh axes smaller than `max(spline_order, 3)` and
+  applies the same lower bound to automatically sized meshes.
 
 - Fixed JAX autodiff through `ewald_reciprocal_space(...)` when `k_vectors`
   are derived from the differentiated cell. The custom JVP previously

@@ -167,7 +167,10 @@ print(f"directed edges   : {len(sources)}")
 # -------------------------
 #
 # ``cell`` and ``r_cut`` are both required. Exactly one of ``mesh_dimensions`` and
-# ``mesh_spacing`` must be given; there is no accuracy-based default.
+# ``mesh_spacing`` must be given; there is no accuracy-based default. ``rank_chunk_size``
+# can be set to a positive Python integer to bound reciprocal workspace.
+
+rank_chunk_size = None
 
 energy, forces, virial = fourier_dftd3(
     positions,
@@ -183,40 +186,14 @@ energy, forces, virial = fourier_dftd3(
     neighbor_ptr=neighbor_ptr,
     unit_shifts=unit_shifts,
     compute_virial=True,
+    exact_moduli=True,
+    rank_chunk_size=rank_chunk_size,
 )
 
 print(f"\nenergy       : {energy.item():.8f} Hartree")
 print(f"             : {energy.item() * HARTREE_TO_EV:.6f} eV")
 print(f"max |force|  : {forces.abs().max().item():.3e} Hartree/Bohr")
 print(f"virial trace : {virial[0].diagonal().sum().item():.6e} Hartree")
-
-# %%
-# Mesh convergence
-# ----------------
-#
-# The mesh is the only accuracy knob on the dispersion sum. Refining it converges the energy;
-# there is no cutoff to enlarge.
-
-print("\n mesh      energy (Hartree)      change")
-previous = None
-for size in (16, 24, 32, 48):
-    value = fourier_dftd3(
-        positions,
-        numbers,
-        a1=0.4289,
-        a2=4.4407,
-        s8=0.7875,
-        fd3_params=params,
-        cell=cell,
-        r_cut=r_cut,
-        mesh_dimensions=(size, size, size),
-        neighbor_list=neighbor_list,
-        neighbor_ptr=neighbor_ptr,
-        unit_shifts=unit_shifts,
-    )[0].item()
-    change = "" if previous is None else f"{abs(value - previous) / abs(value):.2e}"
-    print(f" {size:3d}^3    {value:+.12f}    {change:>9}")
-    previous = value
 
 # %%
 # Summary
@@ -226,8 +203,8 @@ for size in (16, 24, 32, 48):
 #   independently of the functional.
 # - ``fourier_dftd3`` needs a periodic cell and a coordination-number list, and the list's
 #   cutoff must equal ``r_cut``.
-# - Accuracy is controlled by the mesh rather than by a dispersion cutoff, so the cost of a
-#   converged correction does not grow with the interaction range.
+# - Mesh, spline, modulus, decomposition, dtype, and rank-chunk controls are explicit; this
+#   example does not select or recommend calibrated values for another application.
 #
 # For open boundary conditions, or for small molecules where the truncation error does not
 # matter, :func:`nvalchemiops.torch.interactions.dispersion.dftd3` remains the right choice.
