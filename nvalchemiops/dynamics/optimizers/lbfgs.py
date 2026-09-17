@@ -279,7 +279,7 @@ def lbfgs_step_coord(
         _CURVATURE_EPS_F32 if positions.dtype == wp.vec3f else _CURVATURE_EPS_F64
     )
     wp.launch(
-        _kernels.lbfgs_step_kernel,
+        _kernels._lbfgs_step_kernel,
         dim=num_systems,
         inputs=[
             positions,
@@ -340,13 +340,13 @@ def prepare_lbfgs_cell_state(
     atom_ptr_to_batch_idx(ext_atom_ptr, ext_batch_idx)
     if num_systems:
         wp.launch(
-            _kernels.prepare_reference_cell_kernel,
+            _kernels._prepare_reference_cell_kernel,
             dim=num_systems,
             inputs=[cell, ref_cell, ref_cell_inv],
             device=positions.device,
         )
         wp.launch(
-            _kernels.cell_scale_kernel,
+            _kernels._cell_scale_kernel,
             dim=num_systems,
             inputs=[atom_counts, wp.float64(cell_force_scale), cell_scale],
             device=positions.device,
@@ -438,7 +438,7 @@ def lbfgs_step_coord_cell(
         return
 
     wp.launch(
-        _kernels.pack_cell_kernel,
+        _kernels._pack_cell_kernel,
         dim=num_systems,
         inputs=[
             positions,
@@ -462,7 +462,7 @@ def lbfgs_step_coord_cell(
         _CURVATURE_EPS_F32 if positions.dtype == wp.vec3f else _CURVATURE_EPS_F64
     )
     wp.launch(
-        _kernels.lbfgs_step_kernel,
+        _kernels._lbfgs_step_kernel,
         dim=num_systems,
         inputs=[
             state.ext_positions,
@@ -476,7 +476,7 @@ def lbfgs_step_coord_cell(
         device=positions.device,
     )
     wp.launch(
-        _kernels.apply_cell_step_kernel,
+        _kernels._apply_cell_step_kernel,
         dim=num_systems,
         inputs=[
             positions,

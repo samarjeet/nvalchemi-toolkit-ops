@@ -62,7 +62,7 @@ def _alpha_cap(
 
 
 @wp.kernel(enable_backward=False)
-def lbfgs_step_kernel(
+def _lbfgs_step_kernel(
     positions: wp.array(dtype=Any),
     forces: wp.array(dtype=Any),
     batch_idx: wp.array(dtype=wp.int32),
@@ -253,7 +253,7 @@ def lbfgs_step_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def prepare_reference_cell_kernel(
+def _prepare_reference_cell_kernel(
     cell: wp.array(dtype=Any),
     ref_cell: wp.array(dtype=Any),
     ref_cell_inv: wp.array(dtype=Any),
@@ -265,7 +265,7 @@ def prepare_reference_cell_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def cell_scale_kernel(
+def _cell_scale_kernel(
     atom_counts: wp.array(dtype=wp.int32),
     cell_force_scale: wp.float64,
     cell_scale: wp.array(dtype=Any),
@@ -278,7 +278,7 @@ def cell_scale_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def pack_cell_kernel(
+def _pack_cell_kernel(
     positions: wp.array(dtype=Any),
     cell: wp.array(dtype=Any),
     forces: wp.array(dtype=Any),
@@ -335,7 +335,7 @@ def pack_cell_kernel(
 
 
 @wp.kernel(enable_backward=False)
-def apply_cell_step_kernel(
+def _apply_cell_step_kernel(
     positions: wp.array(dtype=Any),
     cell: wp.array(dtype=Any),
     batch_idx: wp.array(dtype=wp.int32),
