@@ -953,6 +953,15 @@ class TestMeshAndUnits:
         assert torch.isfinite(forces).all()
         assert torch.isfinite(virial).all()
 
+    @pytest.mark.parametrize(
+        "invalid", [None, 1, 0.0, "true", torch.tensor(True), np.asarray(True)]
+    )
+    def test_rejects_non_boolean_modulus_configuration(self, invalid):
+        """The modulus convention must be host-static Python configuration."""
+        system = _system("cuda:0")
+        with pytest.raises(ValueError, match="Python or NumPy boolean"):
+            _evaluate(system, exact_moduli=invalid)
+
     def test_rejects_bad_mesh_arguments(self):
         """Degenerate mesh requests are rejected rather than clamped."""
         system = _system("cuda:0")
@@ -1238,6 +1247,20 @@ class TestTorchCompile:
 class TestPrecomputedSetup:
     """Cell- and mesh-derived quantities reused across steps."""
 
+    @pytest.mark.parametrize(
+        "invalid", [None, 1, 0.0, "true", torch.tensor(True), np.asarray(True)]
+    )
+    def test_setup_rejects_non_boolean_modulus_configuration(self, invalid):
+        """Setup construction rejects values that only coerce to booleans."""
+        system = _system("cuda:0")
+        with pytest.raises(ValueError, match="Python or NumPy boolean"):
+            FourierD3Setup.build(
+                system["cell"],
+                system["params"].n_species,
+                MESH,
+                exact_moduli=invalid,
+            )
+
     def test_setup_rejects_mesh_dimension_below_spline_floor(self):
         """Precomputed setups enforce the same mesh floor as the call-time API."""
         system = _system("cuda:0")
@@ -1260,6 +1283,41 @@ class TestPrecomputedSetup:
             inline[1].cpu().numpy(),
             atol=1e-12 * float(inline[1].abs().max()),
         )
+
+    @pytest.mark.parametrize("exact_moduli", [True, False])
+    def test_modulus_convention_matches_computing_inline(self, exact_moduli):
+        """A setup records and reproduces either supported modulus convention."""
+        system = _system("cuda:0")
+        setup = FourierD3Setup.build(
+            system["cell"],
+            system["params"].n_species,
+            MESH,
+            exact_moduli=exact_moduli,
+        )
+        inline = _evaluate(system, exact_moduli=exact_moduli)
+        reused = _evaluate(system, setup=setup, exact_moduli=exact_moduli)
+        assert setup.exact_moduli is exact_moduli
+        for actual, expected in zip(reused, inline, strict=True):
+            np.testing.assert_allclose(
+                actual.cpu().numpy(), expected.cpu().numpy(), rtol=1e-12, atol=1e-12
+            )
+
+    @pytest.mark.parametrize(
+        ("setup_exact_moduli", "call_exact_moduli"), [(True, False), (False, True)]
+    )
+    def test_rejects_modulus_convention_mismatch(
+        self, setup_exact_moduli, call_exact_moduli
+    ):
+        """A call cannot silently override the convention stored in its setup."""
+        system = _system("cuda:0")
+        setup = FourierD3Setup.build(
+            system["cell"],
+            system["params"].n_species,
+            MESH,
+            exact_moduli=setup_exact_moduli,
+        )
+        with pytest.raises(ValueError, match="exact_moduli must match"):
+            _evaluate(system, setup=setup, exact_moduli=call_exact_moduli)
 
     def test_enables_cuda_graph_capture(self):
         """A CUDA graph can be captured only when the setup is precomputed.

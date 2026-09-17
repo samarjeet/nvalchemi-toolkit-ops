@@ -819,6 +819,8 @@ class FourierD3Setup:
         The mesh these were built for.
     spline_order : int
         The spline order these were built for.
+    exact_moduli : bool
+        Whether the stored attenuation uses the exact discrete B-spline modulus.
     """
 
     cell_inv_grouped: torch.Tensor
@@ -829,10 +831,12 @@ class FourierD3Setup:
     moduli_z: torch.Tensor
     mesh_dimensions: tuple[int, int, int]
     spline_order: int
+    exact_moduli: bool = True
 
     def __post_init__(self):
-        """Reject mesh dimensions that cannot hold the interpolation stencil."""
+        """Validate the host-static mesh configuration carried by the setup."""
         _validate_mesh_dimensions(self.mesh_dimensions, self.spline_order)
+        self.exact_moduli = _validate_exact_moduli(self.exact_moduli)
 
     @classmethod
     def build(
@@ -863,6 +867,7 @@ class FourierD3Setup:
         FourierD3Setup
         """
         _validate_mesh_dimensions(mesh_dimensions, spline_order)
+        exact_moduli = _validate_exact_moduli(exact_moduli)
         cells = cell.reshape(-1, 3, 3)
         dtype, device = cells.dtype, cells.device
         mesh_nx, mesh_ny, mesh_nz = (int(n) for n in mesh_dimensions)
@@ -887,6 +892,7 @@ class FourierD3Setup:
             moduli_z=moduli[2],
             mesh_dimensions=(mesh_nx, mesh_ny, mesh_nz),
             spline_order=spline_order,
+            exact_moduli=exact_moduli,
         )
 
 
@@ -1009,6 +1015,16 @@ def _validate_rank_chunk_size(rank_chunk_size: int | None) -> None:
         raise ValueError(
             f"rank_chunk_size must be a positive integer or None, got {rank_chunk_size}."
         )
+
+
+def _validate_exact_moduli(exact_moduli: bool) -> bool:
+    """Require the modulus convention to be host-static Python configuration."""
+    if not isinstance(exact_moduli, (bool, np.bool_)):
+        raise ValueError(
+            "exact_moduli must be a Python or NumPy boolean. Under torch.compile, close "
+            "over the flag or pass an ordinary Python boolean."
+        )
+    return bool(exact_moduli)
 
 
 def _fd3_chunked_pipeline(
@@ -1272,6 +1288,11 @@ def fourier_dftd3(
         Number of retained coefficient-rank columns to process per reciprocal-space pass.
         ``None`` and values at least as large as the retained rank use the unchunked path.
         This is host-static configuration and must be a positive Python integer when set.
+    setup : FourierD3Setup, optional
+        Precomputed cell and mesh quantities. When supplied, its ``mesh_dimensions`` and
+        ``spline_order`` take precedence over the corresponding call arguments, while its
+        modulus convention must equal ``exact_moduli``. Rebuild the setup after changing the
+        cell, mesh, spline order, species count, dtype, device, or modulus convention.
     device : str, optional
         Warp device string. Inferred from ``positions`` when omitted.
 
@@ -1309,6 +1330,7 @@ def fourier_dftd3(
         raise ValueError("cell is required: FourierD3 evaluates a periodic sum.")
     if spline_order < 2 or spline_order > 6:
         raise ValueError(f"spline_order must be between 2 and 6, got {spline_order}.")
+    exact_moduli = _validate_exact_moduli(exact_moduli)
     _validate_rank_chunk_size(rank_chunk_size)
 
     positions = positions if positions.is_floating_point() else positions.double()
@@ -1364,6 +1386,12 @@ def fourier_dftd3(
             )
 
     if setup is not None:
+        if exact_moduli != setup.exact_moduli:
+            raise ValueError(
+                "exact_moduli must match the convention stored in setup: "
+                f"got exact_moduli={exact_moduli} and "
+                f"setup.exact_moduli={setup.exact_moduli}."
+            )
         mesh_nx, mesh_ny, mesh_nz = setup.mesh_dimensions
         spline_order = setup.spline_order
     else:
