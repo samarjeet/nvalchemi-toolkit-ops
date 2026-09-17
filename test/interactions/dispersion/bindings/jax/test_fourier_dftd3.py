@@ -46,6 +46,89 @@ TRICLINIC_CELL = np.array(
     dtype=np.float64,
 )
 
+_FROZEN_TRICLINIC_OUTPUTS = {
+    jnp.float32: (
+        np.array([-0.042421203], dtype=np.float32),
+        np.array(
+            [
+                [7.32706030e-05, 2.59222317e-04, -7.62797499e-05],
+                [-1.29488518e-03, 1.93061540e-03, 3.51413013e-03],
+                [3.60277714e-04, -1.40953547e-04, 1.40327495e-04],
+                [-1.49265805e-04, -1.06874497e-04, 1.78414659e-04],
+                [-1.57069109e-04, 8.88683062e-05, -2.09908729e-04],
+                [6.16686375e-05, -1.09744695e-04, -4.29300067e-04],
+                [5.28315832e-06, 4.07289452e-04, 9.36904617e-05],
+                [1.10058126e-03, -2.32846173e-03, -3.21100932e-03],
+            ],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                [0.04543469, 0.000643458, 0.0036931634],
+                [0.000643458, 0.04162443, -0.0028540797],
+                [0.0036931634, -0.0028540797, 0.043026395],
+            ],
+            dtype=np.float32,
+        ),
+    ),
+    jnp.float64: (
+        np.array([-0.04242115847512903], dtype=np.float64),
+        np.array(
+            [
+                [
+                    7.3272755576328852e-05,
+                    2.5922826286811689e-04,
+                    -7.6292473440352427e-05,
+                ],
+                [
+                    -1.2948776569518261e-03,
+                    1.9306240367039824e-03,
+                    3.5141324796775053e-03,
+                ],
+                [
+                    3.6028863663117617e-04,
+                    -1.4096899420555642e-04,
+                    1.4033575353610551e-04,
+                ],
+                [
+                    -1.4926656250950653e-04,
+                    -1.0686814511734562e-04,
+                    1.7845377942733487e-04,
+                ],
+                [
+                    -1.5707016602808395e-04,
+                    8.8849679514372521e-05,
+                    -2.0989386911122226e-04,
+                ],
+                [
+                    6.1647100556776177e-05,
+                    -1.0973333666189772e-04,
+                    -4.2931902627551508e-04,
+                ],
+                [
+                    5.2917249519913725e-06,
+                    4.0729532280844519e-04,
+                    9.3659491793599909e-05,
+                ],
+                [
+                    1.1005803784227147e-03,
+                    -2.3284506151441341e-03,
+                    -3.2110181605304994e-03,
+                ],
+            ],
+            dtype=np.float64,
+        ),
+        np.array(
+            [
+                [0.04543464167545261, 0.0006434603706614028, 0.0036931676833316836],
+                [0.0006434603706614028, 0.04162438083939287, -0.0028540861723742816],
+                [0.0036931676833316836, -0.0028540861723742816, 0.04302633387731889],
+            ],
+            dtype=np.float64,
+        ),
+    ),
+}
+
 
 @pytest.fixture()
 def device():
@@ -123,6 +206,34 @@ def _evaluate(system, **kwargs):
     arguments.update(kwargs)
     positions = arguments.pop("positions", system["positions"])
     return fourier_dftd3(positions, system["numbers"], **arguments)
+
+
+def _fixed_triclinic_system(dtype):
+    """Build the deterministic mixed-species triclinic public regression fixture."""
+    rng = np.random.default_rng(0)
+    c6ab, cn_ref, species = _reference_tables()
+    max_z = c6ab.shape[0]
+    rcov = np.zeros(max_z)
+    rcov[[1, 6, 8]] = [0.6, 1.2, 1.1]
+    r4r2 = np.zeros(max_z)
+    r4r2[[1, 6, 8]] = [1.0, 1.4, 1.2]
+    positions = rng.uniform(0.1, 0.9, (8, 3)) @ TRICLINIC_CELL
+    numbers = rng.choice(species, 8)
+    targets, pointer, shifts, _ = _neighbour_list(positions, TRICLINIC_CELL, R_CUT)
+    return {
+        "positions": jnp.asarray(positions, dtype=dtype),
+        "numbers": jnp.asarray(numbers, dtype=jnp.int32),
+        "cell": jnp.asarray(TRICLINIC_CELL, dtype=dtype),
+        "params": FourierD3Parameters.from_tables(
+            rcov, r4r2, c6ab, cn_ref, species, dtype=dtype
+        ),
+        "neighbor_list": jnp.asarray(
+            np.stack([np.repeat(np.arange(8), np.diff(pointer)), targets]),
+            dtype=jnp.int32,
+        ),
+        "neighbor_ptr": jnp.asarray(pointer, dtype=jnp.int32),
+        "unit_shifts": jnp.asarray(shifts, dtype=jnp.int32),
+    }
 
 
 def _single(box, seed):
@@ -454,6 +565,34 @@ class TestAgreementWithWarpLayer:
             numerical,
             rtol=1e-6,
             atol=1e-8,
+        )
+
+
+@pytest.mark.gpu
+class TestFrozenReciprocalContraction:
+    """The public binding preserves the ordered reciprocal contraction result."""
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    def test_fixed_mixed_species_triclinic_outputs(self, device, dtype):
+        """Energy, forces, and virial match the pre-rewrite public outputs."""
+        system = _fixed_triclinic_system(dtype)
+        np.testing.assert_array_equal(
+            np.asarray(system["numbers"]), np.array([1, 6, 8, 6, 6, 8, 8, 8])
+        )
+        assert system["params"].rank > 1
+        energy, forces, virial = _evaluate(system, compute_virial=True)
+        expected_energy, expected_forces, expected_virial = _FROZEN_TRICLINIC_OUTPUTS[
+            dtype
+        ]
+        tolerance = (2e-5, 2e-6) if dtype == jnp.float32 else (1e-10, 1e-12)
+        np.testing.assert_allclose(
+            np.asarray(energy), expected_energy, rtol=tolerance[0], atol=tolerance[1]
+        )
+        np.testing.assert_allclose(
+            np.asarray(forces), expected_forces, rtol=tolerance[0], atol=tolerance[1]
+        )
+        np.testing.assert_allclose(
+            np.asarray(virial)[0], expected_virial, rtol=tolerance[0], atol=tolerance[1]
         )
 
 

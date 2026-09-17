@@ -51,6 +51,101 @@ TRICLINIC_CELL = np.array(
     dtype=np.float64,
 )
 
+_FROZEN_TRICLINIC_OUTPUTS = {
+    torch.float32: (
+        np.array([-0.04242118448019028], dtype=np.float32),
+        np.array(
+            [
+                [7.327698403969407e-05, 0.0002592335222288966, -7.628148887306452e-05],
+                [-0.0012948603834956884, 0.0019306077156215906, 0.003514127107337117],
+                [
+                    0.00036028135218657553,
+                    -0.00014095740334596485,
+                    0.00014032777107786387,
+                ],
+                [
+                    -0.00014926462608855218,
+                    -0.00010687720350688323,
+                    0.0001784134074114263,
+                ],
+                [
+                    -0.00015706736303400248,
+                    8.886829891707748e-05,
+                    -0.00020990778284613043,
+                ],
+                [
+                    6.168545223772526e-05,
+                    -0.00010974753240589052,
+                    -0.0004292989906389266,
+                ],
+                [5.288507054501679e-06, 0.0004072889860253781, 9.369157487526536e-05],
+                [0.001100582187063992, -0.002328458707779646, -0.0032110046595335007],
+            ],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                [0.04543466866016388, 0.0006434561219066381, 0.003693157806992531],
+                [0.00064345623832196, 0.04162442311644554, -0.002854075748473406],
+                [0.003693157806992531, -0.002854075748473406, 0.043026383966207504],
+            ],
+            dtype=np.float32,
+        ),
+    ),
+    torch.float64: (
+        np.array([-0.04242115847512903], dtype=np.float64),
+        np.array(
+            [
+                [
+                    7.3272755576330587e-05,
+                    2.5922826286811515e-04,
+                    -7.6292473440352861e-05,
+                ],
+                [
+                    -1.294877656951826e-03,
+                    1.9306240367039824e-03,
+                    3.5141324796775053e-03,
+                ],
+                [
+                    3.602886366311727e-04,
+                    -1.4096899420555642e-04,
+                    1.4033575353610551e-04,
+                ],
+                [
+                    -1.4926656250950653e-04,
+                    -1.0686814511734562e-04,
+                    1.7845377942733487e-04,
+                ],
+                [
+                    -1.5707016602808395e-04,
+                    8.884967951437258e-05,
+                    -2.0989386911122313e-04,
+                ],
+                [
+                    6.164710055677618e-05,
+                    -1.0973333666189772e-04,
+                    -4.2931902627551334e-04,
+                ],
+                [5.2917249519913725e-06, 4.072953228084452e-04, 9.365949183359991e-05],
+                [
+                    1.1005803784227147e-03,
+                    -2.328450615144134e-03,
+                    -3.2110181605304994e-03,
+                ],
+            ],
+            dtype=np.float64,
+        ),
+        np.array(
+            [
+                [0.04543464167545261, 0.0006434603706614, 0.00369316768333168],
+                [0.0006434603706614, 0.04162438083939287, -0.00285408617237428],
+                [0.00369316768333168, -0.00285408617237428, 0.04302633387731889],
+            ],
+            dtype=np.float64,
+        ),
+    ),
+}
+
 
 def _system(device, dtype=None, n_atoms=8, box=9.0, seed=0, cell=None):
     """A small periodic cell with its neighbour list in both formats.
@@ -371,6 +466,37 @@ class TestAgreementWithWarpLayer:
             numerical,
             rtol=1e-6,
             atol=1e-8,
+        )
+
+
+@pytest.mark.gpu
+class TestFrozenReciprocalContraction:
+    """The public binding preserves the ordered reciprocal contraction result."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_fixed_mixed_species_triclinic_outputs(self, dtype):
+        """Energy, forces, and virial match the pre-rewrite public outputs."""
+        system = _system("cuda:0", dtype=dtype, n_atoms=8, seed=0, cell=TRICLINIC_CELL)
+        np.testing.assert_array_equal(
+            system["numbers"].cpu().numpy(), np.array([1, 6, 8, 6, 6, 8, 8, 8])
+        )
+        assert system["params"].rank > 1
+        energy, forces, virial = _evaluate(system, compute_virial=True)
+        expected_energy, expected_forces, expected_virial = _FROZEN_TRICLINIC_OUTPUTS[
+            dtype
+        ]
+        tolerance = (2e-5, 2e-6) if dtype == torch.float32 else (1e-10, 1e-12)
+        np.testing.assert_allclose(
+            energy.cpu().numpy(), expected_energy, rtol=tolerance[0], atol=tolerance[1]
+        )
+        np.testing.assert_allclose(
+            forces.cpu().numpy(), expected_forces, rtol=tolerance[0], atol=tolerance[1]
+        )
+        np.testing.assert_allclose(
+            virial[0].cpu().numpy(),
+            expected_virial,
+            rtol=tolerance[0],
+            atol=tolerance[1],
         )
 
 
