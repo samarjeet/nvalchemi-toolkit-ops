@@ -781,6 +781,127 @@ class TestModulusConventions:
 
 
 @pytest.mark.gpu
+class TestRankChunking:
+    """Rank-chunked reciprocal passes preserve the public outputs."""
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    def test_chunk_sizes_match_unchunked(self, device, dtype):
+        """Unit, non-dividing, equal and oversized chunks agree with the fast path."""
+        system = _fixed_triclinic_system(dtype)
+        rank = system["params"].rank
+        assert rank > 1
+        nondivisor = next((size for size in range(1, rank) if rank % size), rank - 1)
+        expected = _evaluate(system, compute_virial=True)
+        rtol, atol = (2e-5, 2e-6) if dtype == jnp.float32 else (1e-9, 1e-10)
+        for chunk_size in (1, nondivisor, rank, rank + 1):
+            actual = _evaluate(
+                system,
+                compute_virial=True,
+                rank_chunk_size=chunk_size,
+            )
+            for got, want in zip(actual, expected, strict=True):
+                np.testing.assert_allclose(
+                    np.asarray(got), np.asarray(want), rtol=rtol, atol=atol
+                )
+
+    def test_chunked_path_supports_both_modulus_conventions(self, device):
+        """A non-dividing chunk remains valid with both modulus conventions."""
+        system = _fixed_triclinic_system(jnp.float64)
+        rank = system["params"].rank
+        assert rank > 1
+        chunk_size = next((size for size in range(1, rank) if rank % size), rank - 1)
+        for exact_moduli in (True, False):
+            expected = _evaluate(
+                system,
+                compute_virial=True,
+                exact_moduli=exact_moduli,
+            )
+            actual = _evaluate(
+                system,
+                compute_virial=True,
+                exact_moduli=exact_moduli,
+                rank_chunk_size=chunk_size,
+            )
+            for got, want in zip(actual, expected, strict=True):
+                np.testing.assert_allclose(
+                    np.asarray(got), np.asarray(want), rtol=1e-9, atol=1e-10
+                )
+
+    @pytest.mark.parametrize(
+        "invalid", [True, 0, -1, 1.5, "1", np.int64(1), jnp.asarray(1)]
+    )
+    def test_rejects_invalid_chunk_sizes(self, device, system, invalid):
+        """Chunking is a positive host-static Python integer configuration."""
+        with pytest.raises(ValueError, match="rank_chunk_size"):
+            _evaluate(system, rank_chunk_size=invalid)
+
+    def test_empty_system_is_zero_for_chunked_path(self, device, system):
+        """Empty inputs preserve output shapes and zero initialization."""
+        empty = {
+            **system,
+            "positions": jnp.empty((0, 3), dtype=system["positions"].dtype),
+            "numbers": jnp.empty((0,), dtype=jnp.int32),
+            "neighbor_list": jnp.empty((2, 0), dtype=jnp.int32),
+            "neighbor_ptr": jnp.zeros((1,), dtype=jnp.int32),
+            "unit_shifts": jnp.empty((0, 3), dtype=jnp.int32),
+        }
+        rank = empty["params"].rank
+        assert rank > 1
+        energy, forces, virial = _evaluate(
+            empty,
+            compute_virial=True,
+            rank_chunk_size=rank - 1,
+        )
+        assert energy.shape == (1,)
+        assert forces.shape == (0, 3)
+        assert virial.shape == (1, 3, 3)
+        np.testing.assert_array_equal(np.asarray(energy), 0.0)
+        np.testing.assert_array_equal(np.asarray(forces), 0.0)
+        np.testing.assert_array_equal(np.asarray(virial), 0.0)
+
+    def test_rejects_traced_runtime_chunk_size(self, device, system):
+        """A runtime JAX chunk size must be host-static under ``jax.jit``."""
+
+        def evaluate(rank_chunk_size):
+            return _evaluate(system, rank_chunk_size=rank_chunk_size)
+
+        with pytest.raises(ValueError, match="host-static Python integer"):
+            jax.jit(evaluate)(jnp.asarray(1))
+
+    def test_nondividing_chunk_matches_eager_under_jit(self, device, system):
+        """A closed-over non-dividing chunk preserves energy, force, and virial under JIT."""
+        rank = system["params"].rank
+        assert rank > 1
+        chunk_size = next((size for size in range(1, rank) if rank % size), rank - 1)
+
+        def evaluate(positions):
+            return fourier_dftd3(
+                positions,
+                system["numbers"],
+                fd3_params=system["params"],
+                cell=system["cell"],
+                r_cut=R_CUT,
+                mesh_dimensions=MESH,
+                neighbor_list=system["neighbor_list"],
+                neighbor_ptr=system["neighbor_ptr"],
+                unit_shifts=system["unit_shifts"],
+                rank_chunk_size=chunk_size,
+                compute_virial=True,
+                **DAMPING,
+            )
+
+        eager = evaluate(system["positions"])
+        traced = jax.jit(evaluate)(system["positions"])
+        for actual, expected in zip(traced, eager, strict=True):
+            np.testing.assert_allclose(
+                np.asarray(actual),
+                np.asarray(expected),
+                rtol=1e-9,
+                atol=1e-10,
+            )
+
+
+@pytest.mark.gpu
 class TestNeighbourFormats:
     """Both neighbour representations, and the validation around them."""
 
