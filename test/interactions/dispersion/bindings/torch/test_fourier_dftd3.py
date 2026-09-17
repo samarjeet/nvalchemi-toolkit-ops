@@ -46,9 +46,108 @@ from test.interactions.dispersion.test_fourier_dftd3 import (  # noqa: E402
 DAMPING = dict(a1=0.4289, a2=4.4407, s8=0.7875, s6=1.0)
 R_CUT = 4.0
 MESH = (32, 32, 32)
+TRICLINIC_CELL = np.array(
+    [[9.0, 0.0, 0.0], [1.7, 8.4, 0.0], [-0.8, 1.1, 8.7]],
+    dtype=np.float64,
+)
+
+_FROZEN_TRICLINIC_OUTPUTS = {
+    torch.float32: (
+        np.array([-0.04242118448019028], dtype=np.float32),
+        np.array(
+            [
+                [7.327698403969407e-05, 0.0002592335222288966, -7.628148887306452e-05],
+                [-0.0012948603834956884, 0.0019306077156215906, 0.003514127107337117],
+                [
+                    0.00036028135218657553,
+                    -0.00014095740334596485,
+                    0.00014032777107786387,
+                ],
+                [
+                    -0.00014926462608855218,
+                    -0.00010687720350688323,
+                    0.0001784134074114263,
+                ],
+                [
+                    -0.00015706736303400248,
+                    8.886829891707748e-05,
+                    -0.00020990778284613043,
+                ],
+                [
+                    6.168545223772526e-05,
+                    -0.00010974753240589052,
+                    -0.0004292989906389266,
+                ],
+                [5.288507054501679e-06, 0.0004072889860253781, 9.369157487526536e-05],
+                [0.001100582187063992, -0.002328458707779646, -0.0032110046595335007],
+            ],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                [0.04543466866016388, 0.0006434561219066381, 0.003693157806992531],
+                [0.00064345623832196, 0.04162442311644554, -0.002854075748473406],
+                [0.003693157806992531, -0.002854075748473406, 0.043026383966207504],
+            ],
+            dtype=np.float32,
+        ),
+    ),
+    torch.float64: (
+        np.array([-0.04242115847512903], dtype=np.float64),
+        np.array(
+            [
+                [
+                    7.3272755576330587e-05,
+                    2.5922826286811515e-04,
+                    -7.6292473440352861e-05,
+                ],
+                [
+                    -1.294877656951826e-03,
+                    1.9306240367039824e-03,
+                    3.5141324796775053e-03,
+                ],
+                [
+                    3.602886366311727e-04,
+                    -1.4096899420555642e-04,
+                    1.4033575353610551e-04,
+                ],
+                [
+                    -1.4926656250950653e-04,
+                    -1.0686814511734562e-04,
+                    1.7845377942733487e-04,
+                ],
+                [
+                    -1.5707016602808395e-04,
+                    8.884967951437258e-05,
+                    -2.0989386911122313e-04,
+                ],
+                [
+                    6.164710055677618e-05,
+                    -1.0973333666189772e-04,
+                    -4.2931902627551334e-04,
+                ],
+                [5.2917249519913725e-06, 4.072953228084452e-04, 9.365949183359991e-05],
+                [
+                    1.1005803784227147e-03,
+                    -2.328450615144134e-03,
+                    -3.2110181605304994e-03,
+                ],
+            ],
+            dtype=np.float64,
+        ),
+        np.array(
+            [
+                [0.04543464167545261, 0.0006434603706614, 0.00369316768333168],
+                [0.0006434603706614, 0.04162438083939287, -0.00285408617237428],
+                [0.00369316768333168, -0.00285408617237428, 0.04302633387731889],
+            ],
+            dtype=np.float64,
+        ),
+    ),
+}
 
 
-def _system(device, dtype=None, n_atoms=8, box=9.0, seed=0):
+def _system(device, dtype=None, n_atoms=8, box=9.0, seed=0, cell=None):
     """A small periodic cell with its neighbour list in both formats.
 
     ``dtype`` defaults to ``torch.float64``, resolved on the call rather than written into
@@ -65,9 +164,13 @@ def _system(device, dtype=None, n_atoms=8, box=9.0, seed=0):
     r4r2 = np.zeros(max_z)
     r4r2[[1, 6, 8]] = [1.0, 1.4, 1.2]
 
-    positions = rng.uniform(0.0, box, (n_atoms, 3))
+    if cell is None:
+        cell = np.eye(3) * box
+        positions = rng.uniform(0.0, box, (n_atoms, 3))
+    else:
+        cell = np.asarray(cell, dtype=np.float64)
+        positions = rng.uniform(0.1, 0.9, (n_atoms, 3)) @ cell
     numbers = rng.choice(species, n_atoms)
-    cell = np.eye(3) * box
     targets, pointer, shifts, _ = _neighbour_list(positions, cell, R_CUT)
     sources = np.repeat(np.arange(n_atoms), np.diff(pointer))
 
@@ -312,6 +415,170 @@ class TestAgreementWithWarpLayer:
         np.testing.assert_allclose(
             analytic, numerical, atol=1e-6 * np.abs(numerical).max()
         )
+
+    def test_triclinic_forces_match_finite_differences(self):
+        """Cartesian forces remain the negative energy gradient in a triclinic cell."""
+        device = "cuda:0"
+        system = _system(device, n_atoms=6, seed=3, cell=TRICLINIC_CELL)
+        analytic = _evaluate(system)[1].cpu().numpy()
+
+        step = 1e-5
+        base = system["positions"].clone()
+        numerical = np.zeros_like(analytic)
+        for atom in range(system["n_atoms"]):
+            for axis in range(3):
+                for sign in (1.0, -1.0):
+                    system["positions"] = base.clone()
+                    system["positions"][atom, axis] += sign * step
+                    energy = _evaluate(system)[0]
+                    numerical[atom, axis] -= sign * float(energy) / (2.0 * step)
+        system["positions"] = base
+        np.testing.assert_allclose(analytic, numerical, rtol=1e-6, atol=1e-8)
+
+    def test_triclinic_virial_matches_six_strain_derivatives(self):
+        """The six independent virial components match triclinic strain differences."""
+        device = "cuda:0"
+        system = _system(device, n_atoms=6, seed=3, cell=TRICLINIC_CELL)
+        analytic = _evaluate(system, compute_virial=True)[2][0].cpu().numpy()
+
+        step = 1e-6
+        base_positions = system["positions"].clone()
+        base_cell = system["cell"].clone()
+        components = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
+        numerical = np.zeros(len(components))
+        for index, (row, column) in enumerate(components):
+            energies = []
+            for sign in (1.0, -1.0):
+                strain = torch.zeros(3, 3, dtype=base_cell.dtype, device=device)
+                strain[row, column] = sign * step
+                deformation = (
+                    torch.eye(3, dtype=base_cell.dtype, device=device) + strain
+                )
+                system["positions"] = base_positions @ deformation.T
+                system["cell"] = base_cell @ deformation.T
+                energies.append(float(_evaluate(system)[0]))
+            numerical[index] = (energies[0] - energies[1]) / (2.0 * step)
+        system["positions"], system["cell"] = base_positions, base_cell
+        np.testing.assert_allclose(
+            analytic[
+                [row for row, _ in components], [column for _, column in components]
+            ],
+            numerical,
+            rtol=1e-6,
+            atol=1e-8,
+        )
+
+
+@pytest.mark.gpu
+class TestFrozenReciprocalContraction:
+    """The public binding preserves the ordered reciprocal contraction result."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_fixed_mixed_species_triclinic_outputs(self, dtype):
+        """Energy, forces, and virial match the pre-rewrite public outputs."""
+        system = _system("cuda:0", dtype=dtype, n_atoms=8, seed=0, cell=TRICLINIC_CELL)
+        np.testing.assert_array_equal(
+            system["numbers"].cpu().numpy(), np.array([1, 6, 8, 6, 6, 8, 8, 8])
+        )
+        assert system["params"].rank > 1
+        energy, forces, virial = _evaluate(system, compute_virial=True)
+        expected_energy, expected_forces, expected_virial = _FROZEN_TRICLINIC_OUTPUTS[
+            dtype
+        ]
+        tolerance = (2e-5, 2e-6) if dtype == torch.float32 else (1e-10, 1e-12)
+        np.testing.assert_allclose(
+            energy.cpu().numpy(), expected_energy, rtol=tolerance[0], atol=tolerance[1]
+        )
+        np.testing.assert_allclose(
+            forces.cpu().numpy(), expected_forces, rtol=tolerance[0], atol=tolerance[1]
+        )
+        np.testing.assert_allclose(
+            virial[0].cpu().numpy(),
+            expected_virial,
+            rtol=tolerance[0],
+            atol=tolerance[1],
+        )
+
+
+@pytest.mark.gpu
+class TestRankChunking:
+    """Rank-chunked reciprocal passes preserve the public outputs."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_chunk_sizes_match_unchunked(self, dtype):
+        """Unit, non-dividing, equal and oversized chunks agree with the fast path."""
+        system = _system("cuda:0", dtype=dtype, n_atoms=8, seed=0)
+        rank = system["params"].rank
+        assert rank > 1
+        nondivisor = next((size for size in range(1, rank) if rank % size), rank - 1)
+        expected = _evaluate(system, compute_virial=True)
+        rtol, atol = (2e-5, 2e-6) if dtype == torch.float32 else (1e-9, 1e-10)
+        for chunk_size in (1, nondivisor, rank, rank + 1):
+            actual = _evaluate(
+                system,
+                compute_virial=True,
+                rank_chunk_size=chunk_size,
+            )
+            for got, want in zip(actual, expected, strict=True):
+                np.testing.assert_allclose(
+                    got.cpu().numpy(), want.cpu().numpy(), rtol=rtol, atol=atol
+                )
+
+    def test_chunked_path_supports_both_modulus_conventions(self):
+        """A non-dividing chunk remains valid with the PME modulus convention."""
+        system = _system("cuda:0", dtype=torch.float64, n_atoms=8, seed=0)
+        rank = system["params"].rank
+        assert rank > 1
+        chunk_size = next((size for size in range(1, rank) if rank % size), rank - 1)
+        for exact_moduli in (True, False):
+            expected = _evaluate(
+                system,
+                compute_virial=True,
+                exact_moduli=exact_moduli,
+            )
+            actual = _evaluate(
+                system,
+                compute_virial=True,
+                exact_moduli=exact_moduli,
+                rank_chunk_size=chunk_size,
+            )
+            for got, want in zip(actual, expected, strict=True):
+                np.testing.assert_allclose(
+                    got.cpu().numpy(), want.cpu().numpy(), rtol=1e-9, atol=1e-10
+                )
+
+    @pytest.mark.parametrize("invalid", [True, 0, -1, 1.5, torch.tensor(1)])
+    def test_rejects_invalid_chunk_sizes(self, invalid):
+        """Chunking is a positive host-static Python integer configuration."""
+        system = _system("cuda:0", n_atoms=4, seed=2)
+        with pytest.raises(ValueError, match="rank_chunk_size"):
+            _evaluate(system, rank_chunk_size=invalid)
+
+    def test_empty_system_is_zero_for_chunked_path(self):
+        """Empty inputs preserve output shapes and zero initialization."""
+        # Build a non-empty fixture first because the shared dense conversion helper does
+        # not represent an empty shift array; the public call below uses CSR with no edges.
+        system = _system("cuda:0", n_atoms=2, seed=2)
+        system["positions"] = torch.empty(
+            0, 3, dtype=system["positions"].dtype, device="cuda:0"
+        )
+        system["numbers"] = torch.empty(0, dtype=torch.int32, device="cuda:0")
+        system["neighbor_list"] = torch.empty(2, 0, dtype=torch.int32, device="cuda:0")
+        system["neighbor_ptr"] = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+        system["unit_shifts"] = torch.empty(0, 3, dtype=torch.int32, device="cuda:0")
+        rank = system["params"].rank
+        assert rank > 1
+        energy, forces, virial = _evaluate(
+            system,
+            compute_virial=True,
+            rank_chunk_size=rank - 1,
+        )
+        assert energy.shape == (1,)
+        assert forces.shape == (0, 3)
+        assert virial.shape == (1, 3, 3)
+        assert torch.count_nonzero(energy).item() == 0
+        assert torch.count_nonzero(forces).item() == 0
+        assert torch.count_nonzero(virial).item() == 0
 
 
 def _decomposition_view(parameters):
@@ -570,6 +837,131 @@ class TestMeshAndUnits:
             by_spacing[0].cpu().numpy(), by_dimensions[0].cpu().numpy(), rtol=1e-12
         )
 
+    @pytest.mark.parametrize(
+        ("spline_order", "mesh_dimensions"),
+        [(2, (2, 3, 3)), (3, (2, 3, 3)), (5, (4, 5, 5)), (6, (5, 6, 6))],
+    )
+    def test_rejects_mesh_dimension_below_spline_floor(
+        self, spline_order, mesh_dimensions
+    ):
+        """Every mesh axis must fit the requested interpolation stencil."""
+        system = _system("cuda:0")
+        minimum = max(spline_order, 3)
+        with pytest.raises(
+            ValueError,
+            match=rf"at least max\(spline_order, 3\) = {minimum}",
+        ):
+            _evaluate(
+                system,
+                mesh_dimensions=mesh_dimensions,
+                spline_order=spline_order,
+            )
+
+    @pytest.mark.parametrize("exact_moduli", [True, False])
+    @pytest.mark.parametrize(
+        ("spline_order", "mesh_dimensions"),
+        [(2, (3, 4, 5)), (5, (5, 6, 7)), (6, (6, 7, 8))],
+    )
+    def test_accepts_floor_mesh_for_both_moduli(
+        self, exact_moduli, spline_order, mesh_dimensions
+    ):
+        """Exact-bound meshes remain valid for both exposed modulus conventions."""
+        system = _system("cuda:0")
+        energy, forces = _evaluate(
+            system,
+            mesh_dimensions=mesh_dimensions,
+            spline_order=spline_order,
+            exact_moduli=exact_moduli,
+        )
+        assert torch.isfinite(energy).all()
+        assert torch.isfinite(forces).all()
+
+    @pytest.mark.parametrize("spline_order", [2, 5, 6])
+    def test_coarse_spacing_is_clamped_to_spline_floor(self, spline_order):
+        """Automatic sizing must apply the same lower bound as explicit sizing."""
+        system = _system("cuda:0")
+        minimum = max(spline_order, 3)
+        by_spacing = _evaluate(
+            system,
+            mesh_dimensions=None,
+            mesh_spacing=100.0,
+            spline_order=spline_order,
+        )
+        by_dimensions = _evaluate(
+            system,
+            mesh_dimensions=(minimum, minimum, minimum),
+            spline_order=spline_order,
+        )
+        np.testing.assert_allclose(
+            by_spacing[0].cpu().numpy(), by_dimensions[0].cpu().numpy(), rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            by_spacing[1].cpu().numpy(),
+            by_dimensions[1].cpu().numpy(),
+            atol=1e-11 * float(by_dimensions[1].abs().max()),
+        )
+
+    def test_batched_spacing_matches_smooth_explicit_mesh(self):
+        """Automatic sizing uses all batched axes and matches the rounded public result."""
+        cells = [
+            np.diag([17.0, 6.0, 5.0]),
+            np.diag([5.0, 11.0, 6.0]),
+            np.diag([7.0, 8.0, 13.0]),
+        ]
+        systems = [
+            _system("cuda:0", seed=index, cell=cell) for index, cell in enumerate(cells)
+        ]
+        batch = _batched(systems)
+        automatic = _evaluate(
+            batch,
+            batch_idx=batch["batch_idx"],
+            num_systems=batch["num_systems"],
+            mesh_dimensions=None,
+            mesh_spacing=1.0,
+            exact_moduli=True,
+            compute_virial=True,
+        )
+        explicit = _evaluate(
+            batch,
+            batch_idx=batch["batch_idx"],
+            num_systems=batch["num_systems"],
+            mesh_dimensions=(18, 12, 14),
+            mesh_spacing=None,
+            exact_moduli=True,
+            compute_virial=True,
+        )
+        for actual, expected in zip(automatic, explicit, strict=True):
+            np.testing.assert_allclose(
+                actual.cpu().numpy(), expected.cpu().numpy(), rtol=1e-12, atol=1e-12
+            )
+        lengths = torch.linalg.norm(batch["cell"], dim=-1).amax(dim=0)
+        assert all(
+            float(length) / dimension <= 1.0
+            for length, dimension in zip(lengths, (18, 12, 14), strict=True)
+        )
+
+    def test_explicit_non_smooth_mesh_is_accepted_publicly(self):
+        """A valid non-smooth explicit mesh remains usable through the public API."""
+        system = _system("cuda:0")
+        energy, forces, virial = _evaluate(
+            system,
+            mesh_dimensions=(17, 19, 23),
+            mesh_spacing=None,
+            compute_virial=True,
+        )
+        assert torch.isfinite(energy).all()
+        assert torch.isfinite(forces).all()
+        assert torch.isfinite(virial).all()
+
+    @pytest.mark.parametrize(
+        "invalid", [None, 1, 0.0, "true", torch.tensor(True), np.asarray(True)]
+    )
+    def test_rejects_non_boolean_modulus_configuration(self, invalid):
+        """The modulus convention must be host-static Python configuration."""
+        system = _system("cuda:0")
+        with pytest.raises(ValueError, match="Python or NumPy boolean"):
+            _evaluate(system, exact_moduli=invalid)
+
     def test_rejects_bad_mesh_arguments(self):
         """Degenerate mesh requests are rejected rather than clamped."""
         system = _system("cuda:0")
@@ -819,10 +1211,63 @@ class TestTorchCompile:
                 first
             )
 
+    def test_chunked_nondivisible_remainder_compiles_fullgraph(self):
+        """A closed-over non-dividing chunk size remains one full Torch graph."""
+        system = _system("cuda:0", n_atoms=8, seed=0)
+        rank = system["params"].rank
+        nondivisor = next((size for size in range(1, rank) if rank % size), None)
+        assert nondivisor is not None
+
+        # Close over every input except the coordinate tensor, as an MD step would.
+        def compiled_evaluate(positions):
+            return fourier_dftd3(
+                positions,
+                system["numbers"],
+                fd3_params=system["params"],
+                cell=system["cell"],
+                r_cut=R_CUT,
+                mesh_dimensions=MESH,
+                neighbor_list=system["neighbor_list"],
+                neighbor_ptr=system["neighbor_ptr"],
+                unit_shifts=system["unit_shifts"],
+                compute_virial=True,
+                rank_chunk_size=nondivisor,
+                **DAMPING,
+            )
+
+        expected = compiled_evaluate(system["positions"])
+        actual = torch.compile(compiled_evaluate, fullgraph=True)(system["positions"])
+        for got, want in zip(actual, expected, strict=True):
+            np.testing.assert_allclose(
+                got.cpu().numpy(), want.cpu().numpy(), rtol=1e-9, atol=1e-10
+            )
+
 
 @pytest.mark.gpu
 class TestPrecomputedSetup:
     """Cell- and mesh-derived quantities reused across steps."""
+
+    @pytest.mark.parametrize(
+        "invalid", [None, 1, 0.0, "true", torch.tensor(True), np.asarray(True)]
+    )
+    def test_setup_rejects_non_boolean_modulus_configuration(self, invalid):
+        """Setup construction rejects values that only coerce to booleans."""
+        system = _system("cuda:0")
+        with pytest.raises(ValueError, match="Python or NumPy boolean"):
+            FourierD3Setup.build(
+                system["cell"],
+                system["params"].n_species,
+                MESH,
+                exact_moduli=invalid,
+            )
+
+    def test_setup_rejects_mesh_dimension_below_spline_floor(self):
+        """Precomputed setups enforce the same mesh floor as the call-time API."""
+        system = _system("cuda:0")
+        with pytest.raises(ValueError, match=r"at least max\(spline_order, 3\) = 5"):
+            FourierD3Setup.build(
+                system["cell"], system["params"].n_species, (4, 5, 5), spline_order=5
+            )
 
     def test_matches_computing_them_inline(self):
         """Supplying the setup gives the same answer as letting the call derive it."""
@@ -838,6 +1283,41 @@ class TestPrecomputedSetup:
             inline[1].cpu().numpy(),
             atol=1e-12 * float(inline[1].abs().max()),
         )
+
+    @pytest.mark.parametrize("exact_moduli", [True, False])
+    def test_modulus_convention_matches_computing_inline(self, exact_moduli):
+        """A setup records and reproduces either supported modulus convention."""
+        system = _system("cuda:0")
+        setup = FourierD3Setup.build(
+            system["cell"],
+            system["params"].n_species,
+            MESH,
+            exact_moduli=exact_moduli,
+        )
+        inline = _evaluate(system, exact_moduli=exact_moduli)
+        reused = _evaluate(system, setup=setup, exact_moduli=exact_moduli)
+        assert setup.exact_moduli is exact_moduli
+        for actual, expected in zip(reused, inline, strict=True):
+            np.testing.assert_allclose(
+                actual.cpu().numpy(), expected.cpu().numpy(), rtol=1e-12, atol=1e-12
+            )
+
+    @pytest.mark.parametrize(
+        ("setup_exact_moduli", "call_exact_moduli"), [(True, False), (False, True)]
+    )
+    def test_rejects_modulus_convention_mismatch(
+        self, setup_exact_moduli, call_exact_moduli
+    ):
+        """A call cannot silently override the convention stored in its setup."""
+        system = _system("cuda:0")
+        setup = FourierD3Setup.build(
+            system["cell"],
+            system["params"].n_species,
+            MESH,
+            exact_moduli=setup_exact_moduli,
+        )
+        with pytest.raises(ValueError, match="exact_moduli must match"):
+            _evaluate(system, setup=setup, exact_moduli=call_exact_moduli)
 
     def test_enables_cuda_graph_capture(self):
         """A CUDA graph can be captured only when the setup is precomputed.

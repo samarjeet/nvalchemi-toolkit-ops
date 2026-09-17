@@ -938,25 +938,17 @@ The two are not interchangeable, and neither is uniformly better.
 | Dispersion cutoff | yours to choose, and to converge | none |
 | Cost with accuracy | grows as the cutoff cubed | flat, set by the mesh |
 | Coordination-number function | standard D3 | modified, decays to zero at the list cutoff |
-| Best for | molecules in vacuum, small cells, cheap approximate corrections | condensed phases, and anything where the truncation error matters |
+| Primary constraint | caller-selected real-space truncation | periodic particle mesh |
 
-The reason to reach for `fourier_dftd3` is convergence rather than raw speed. A `1/r^6`
-interaction summed over three dimensions leaves a truncation error decaying only as `1/r^3`,
-so converging `dftd3` to sub-meV/atom needs a cutoff far beyond an MLFF's own, and the
-neighbour list then dominates the step. `fourier_dftd3` removes the cutoff instead of
-enlarging it.
+`fourier_dftd3` removes the dispersion cutoff by evaluating the periodic sum on a mesh. The
+coordination-number calculation still uses the caller's neighbour list and cutoff.
 
 ```{important}
-The two do not produce identical numbers, and are not expected to. `fourier_dftd3` uses a
+The two do not produce identical numbers. `fourier_dftd3` uses a
 modified coordination-number function that decays to zero at the list cutoff, where the
 standard D3 function tends to a non-zero constant. That difference is what makes the
 coordination numbers independent of the list used to build them; without it, no choice of
 cutoff converges.
-
-In practice the gap is small. On diamond with the published tables, `fourier_dftd3` reading
-only a 6 Angstrom list agrees to `5.9e-06` relative with `dftd3` extrapolated to an infinite
-cutoff --- where `dftd3` at that same 6 Angstrom cutoff is still 10% short. Treat a
-difference of that order as the model difference; treat a large one as a bug report.
 ```
 
 ```{note}
@@ -992,6 +984,7 @@ energy, forces = fourier_dftd3(
     fd3_params=params, cell=cell, r_cut=r_cut,
     mesh_dimensions=(32, 32, 32),
     neighbor_list=neighbors, neighbor_ptr=pointer, unit_shifts=shifts,
+    exact_moduli=True, rank_chunk_size=None,
 )
 ```
 
@@ -1017,73 +1010,46 @@ what `neighbor_list` and the dense builders produce by default; a list requested
 
 FourierD3 accumulates each atom's coordination number, and the chain rule from it, out of
 that atom's own row alone --- the reverse edge is walked by the other atom. A half-filled
-list therefore loses half of every atom's coordination, which shifts the energy by around a
-percent and leaves the forces non-conservative, with nothing in the output to say so.
+list therefore loses half of every atom's coordination, changes the energy, and leaves the
+forces non-conservative.
 
 `fourier_dftd3` rejects such a list rather than using it. The check is a cheap necessary
 condition, not a proof: a full directed list sums `source - target` and the image shifts to
 exactly zero, so a valid list never trips it, but a pathological one could slip through.
 ```
 
-### Choosing a Spline Order
+### Tuning Controls
 
-`spline_order` runs from 2 to 6 and defaults to 4. Every order converges to the same
-energy --- the lattice sum does not depend on how it was interpolated --- but accuracy at a
-fixed mesh improves sharply with order. Measured on an 8-atom cell at a 96³ mesh, against a
-converged reference:
+Torch and JAX expose the same numerical controls. No calibrated setting is implied by the
+defaults or examples; choose values for the accuracy and resource requirements of the calling
+application.
 
-| order | relative error |
+| Control | Contract |
 |---|---|
-| 2 | `2.8e-05` |
-| 3 | `2.5e-07` |
-| 4 | `2.0e-09` |
-| 5 | `1.4e-10` |
+| `r_cut` | Coordination-number cutoff. It must equal the cutoff used to build the neighbour list. |
+| `mesh_dimensions` | Three explicit dimensions. Each must be at least `max(spline_order, 3)`. Explicit dimensions are used unchanged, including valid non-smooth sizes. |
+| `mesh_spacing` | Maximum spacing along each cell-vector axis. Each raw ceiling is rounded upward to the next size whose prime factors are only 2, 3, 5, and 7. Batched calls use the largest length on each axis. |
+| `spline_order` | B-spline order from 2 through 6. It also sets the lower bound on every mesh dimension. |
+| `tol`, `max_rank` | Host-side controls passed to `FourierD3Parameters.from_tables` when decomposing the reference C6 tensor. |
+| array dtype | `float32` or `float64`, selected by the input arrays and parameter object. |
+| `exact_moduli` | `True` uses the exact discrete B-spline modulus; `False` uses the continuous `sinc(m/N)**p` convention. |
+| `rank_chunk_size` | `None` or a value at least equal to the retained rank uses one reciprocal pass. A smaller positive integer limits the rank channels held per FFT, reducing peak reciprocal workspace at the cost of additional FFTs and kernel launches. |
 
-Raising the order is usually cheaper than refining the mesh, since the spread and gather
-cost `order³` per atom while the transform cost grows with the mesh volume. Order 3 is
-noticeably noisier than its neighbours and its error does not fall cleanly with refinement,
-so prefer an even order unless you have measured otherwise.
+Exactly one of `mesh_dimensions` or `mesh_spacing` is required. Automatic spacing reads cell
+lengths on the host, so JAX callers must pass explicit dimensions inside `jax.jit`.
 
-### Choosing a Mesh
+`exact_moduli` and `rank_chunk_size` are host-static configuration. Close over them or mark
+them static under `jax.jit`; pass ordinary Python values under `torch.compile`. A runtime
+tensor or traced array is not accepted for either choice.
 
-Exactly one of `mesh_dimensions` or `mesh_spacing` is required; there is no accuracy-based
-default to fall back on, so neither and both are errors. As a starting point, from the
-FourierD3 paper:
+The mesh carries `num_systems * n_species * retained_rank` channels without chunking.
+`rank_chunk_size` bounds the retained-rank factor in that workspace; it does not change the
+C6 decomposition, self-energy, coordination numbers, forces, or virial.
 
-| System size | Mesh |
-|---|---|
-| up to 200 atoms | 16³ |
-| up to 2,000 | 32³ |
-| up to 20,000 | 64³ |
-| beyond | 128³ |
+### Precomputed Torch Setup
 
-To size the mesh from a target reciprocal cutoff instead, `k_max = pi * N / L` gives
-`N = ceil(k_cut * L / pi)`.
-
-The mesh carries `num_systems * n_species * rank` channels, where `rank` comes from the
-decomposition and is typically 4 to 8. Memory grows with all three, so batching chemically
-dissimilar systems together costs more than batching similar ones.
-
-### B-spline Deconvolution
-
-Interpolating onto a mesh attenuates each frequency, and dividing that attenuation out is what
-recovers the structure factor the mesh stands in for. Two conventions exist: the discrete
-modulus, which is the magnitude of the DFT of the spline coefficients and is what
-interpolation on a finite mesh actually applies, and `sinc(m/N)**p`, its continuous
-approximation, which the electrostatics PME path in this package uses.
-
-FourierD3 uses the **discrete** form by default. Measured against an independent
-implementation of the same method, the discrete form agrees to machine precision while the
-continuous one leaves a force discrepancy around `1e-5` at a 48-cubed mesh. Pass
-`exact_moduli=False` only to reproduce the PME convention.
-
-### Making It Fast
-
-Two things matter, and neither is `torch.compile` on its own.
-
-**Precompute the cell-derived setup.** `FourierD3Setup.build` derives the inverse cell, the
-volume, the reciprocal lattice and the B-spline moduli. None of them change while the cell and
-mesh are fixed, and deriving them costs a matrix inversion per call.
+`FourierD3Setup.build` derives the inverse cell, volume, reciprocal lattice, and B-spline
+moduli. Reuse it only while the cell, mesh, spline order, and species count are unchanged.
 
 ```python
 from nvalchemiops.torch.interactions.dispersion import FourierD3Setup
@@ -1093,28 +1059,9 @@ for step in trajectory:                      # constant-volume dynamics
     energy, forces = fourier_dftd3(..., setup=setup)
 ```
 
-Measured on an RTX PRO 6000, this alone is worth **1.3x to 1.7x**, the larger figure on small
-systems where the per-call setup is a bigger share of the total.
-
-It is also **required for `torch.compile(mode="reduce-overhead")`**: that mode records a CUDA
+It is required for `torch.compile(mode="reduce-overhead")`: that mode records a CUDA
 graph, and `torch.linalg.inv` cannot be recorded into one. Without a precomputed setup the
 compilation fails rather than falling back.
-
-**`torch.compile` adds a little more.** Around 1.05x on top of the precomputed setup. The time
-is dominated by Warp kernels and FFTs, which compilation cannot fuse into, so do not expect
-more. It does trace without graph breaks.
-
-| N | eager | + setup | + `torch.compile` |
-|---|---|---|---|
-| 200 | 3.78 ms | 2.37 ms | 2.22 ms |
-| 2,000 | 4.25 ms | 2.77 ms | 2.68 ms |
-| 20,000 | 6.50 ms | 5.04 ms | 5.04 ms |
-
-```{important}
-For the JAX binding, `jax.jit` is not optional. Unjitted, every operation dispatches
-separately and the evaluation takes around 92 ms regardless of system size; jitted it is
-2.6 to 4.4 ms, a **21x to 35x** difference. Always wrap the call in `jax.jit`.
-```
 
 ### What FourierD3 Returns
 
@@ -1122,7 +1069,8 @@ separately and the evaluation takes around 92 ms regardless of system size; jitt
 `dE/d(strain)`, the same convention as `dftd3`.
 
 Forces are an explicit output rather than something recovered by differentiating the energy,
-again matching `dftd3`.
+again matching `dftd3`. The Torch binding does not register an autograd formula, and the JAX
+Warp callbacks are created without backward differentiation.
 
 ```{note}
 Energies are reduced with atomic adds, whose summation order varies between launches, so two

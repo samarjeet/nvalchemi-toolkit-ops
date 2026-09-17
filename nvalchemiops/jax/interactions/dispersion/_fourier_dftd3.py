@@ -212,7 +212,30 @@ class FourierD3Parameters:
         )
 
 
-def _resolve_mesh(mesh_dimensions, mesh_spacing, cells):
+def _validate_mesh_dimensions(mesh_dimensions, spline_order):
+    """Validate dimensions against the minimum supported by the spline stencil."""
+    minimum = max(spline_order, 3)
+    if len(mesh_dimensions) != 3 or any(int(n) < minimum for n in mesh_dimensions):
+        raise ValueError(
+            "mesh_dimensions must be three positive integers with each dimension at "
+            f"least max(spline_order, 3) = {minimum}, got {mesh_dimensions}."
+        )
+
+
+def _smooth_mesh_size(size):
+    """Round a mesh size up to an integer with only small prime factors."""
+    candidate = int(size)
+    while True:
+        remainder = candidate
+        for prime in (2, 3, 5, 7):
+            while remainder % prime == 0:
+                remainder //= prime
+        if remainder == 1:
+            return candidate
+        candidate += 1
+
+
+def _resolve_mesh(mesh_dimensions, mesh_spacing, cells, spline_order):
     """Settle the mesh size, requiring exactly one of the two ways of asking for it."""
     if (mesh_dimensions is None) == (mesh_spacing is None):
         raise ValueError(
@@ -220,10 +243,7 @@ def _resolve_mesh(mesh_dimensions, mesh_spacing, cells):
             "accuracy-based default for FourierD3."
         )
     if mesh_dimensions is not None:
-        if len(mesh_dimensions) != 3 or any(int(n) < 1 for n in mesh_dimensions):
-            raise ValueError(
-                f"mesh_dimensions must be three positive integers, got {mesh_dimensions}."
-            )
+        _validate_mesh_dimensions(mesh_dimensions, spline_order)
         return tuple(int(n) for n in mesh_dimensions)
     if mesh_spacing <= 0.0:
         raise ValueError(f"mesh_spacing must be positive, got {mesh_spacing}.")
@@ -234,7 +254,39 @@ def _resolve_mesh(mesh_dimensions, mesh_spacing, cells):
             "mesh_spacing reads the cell lengths, which is not possible inside jax.jit. "
             "Pass mesh_dimensions explicitly when tracing."
         ) from None
-    return tuple(max(1, int(np.ceil(length / mesh_spacing))) for length in lengths)
+    minimum = max(spline_order, 3)
+    return tuple(
+        _smooth_mesh_size(max(minimum, int(np.ceil(length / mesh_spacing))))
+        for length in lengths
+    )
+
+
+def _validate_exact_moduli(exact_moduli):
+    """Require the modulus convention to be host-static Python configuration."""
+    if not isinstance(exact_moduli, (bool, np.bool_)):
+        raise TypeError(
+            "exact_moduli must be a Python or NumPy boolean. Under jax.jit, close over "
+            "the flag or pass it as a static argument."
+        )
+    return bool(exact_moduli)
+
+
+def _validate_rank_chunk_size(rank_chunk_size: int | None) -> int | None:
+    """Validate the host-static rank chunk configuration."""
+    if rank_chunk_size is None:
+        return None
+    if isinstance(rank_chunk_size, bool) or type(rank_chunk_size) is not int:
+        raise ValueError(
+            "rank_chunk_size must be a positive host-static Python integer or None; "
+            f"got {type(rank_chunk_size).__name__}. Under jax.jit, close over the "
+            "chunk size or pass it as a static argument."
+        )
+    if rank_chunk_size <= 0:
+        raise ValueError(
+            "rank_chunk_size must be a positive host-static Python integer or None; "
+            f"got {rank_chunk_size}."
+        )
+    return rank_chunk_size
 
 
 def _reject_half_filled(
@@ -306,6 +358,8 @@ def fourier_dftd3(
     batch_idx=None,
     compute_virial: bool = False,
     num_systems: int | None = None,
+    exact_moduli: bool = True,
+    rank_chunk_size: int | None = None,
 ):
     r"""Evaluate the DFT-D3(BJ) dispersion correction by particle-mesh summation.
 
@@ -329,8 +383,9 @@ def fourier_dftd3(
         Coordination-number cutoff, in the same length unit as ``positions``. Must equal the
         radius the neighbour list was built with.
     mesh_dimensions, mesh_spacing
-        Exactly one is required. ``mesh_spacing`` reads cell lengths and so cannot be used
-        inside ``jax.jit``.
+        Exactly one is required. ``mesh_spacing`` is a maximum spacing: each inferred
+        dimension is rounded upward to the next value factorizable by 2, 3, 5, and 7.
+        It reads cell lengths and so cannot be used inside ``jax.jit``.
     neighbor_matrix, neighbor_matrix_shifts, neighbor_list, neighbor_ptr, unit_shifts
         Exactly one neighbour format, with its matching lattice images.
 
@@ -344,17 +399,22 @@ def fourier_dftd3(
     s6 : float, default=1.0
         Sixth-order scaling.
     spline_order : int, default=4
-        B-spline interpolation order, from 2 to 6. Accuracy at a fixed mesh improves with
-        order: measured against a converged reference, orders 2 to 5 land roughly three
-        orders of magnitude apart each way, so raising the order buys more than refining the
-        mesh does. Order 3 is noticeably noisier than its neighbours; prefer an even order
-        unless you have measured otherwise.
+        B-spline interpolation order, from 2 to 6. Every mesh dimension must be at least
+        ``max(spline_order, 3)``.
     batch_idx : jax.Array, shape (N,), optional
         System index per atom.
     compute_virial : bool, default=False
         Whether to return the virial.
     num_systems : int, optional
         Number of systems. Inferred from ``cell`` when omitted.
+    exact_moduli : bool, default=True
+        Use the exact discrete B-spline modulus. Set to ``False`` to use the continuous
+        ``sinc(m/N)**p`` convention. This is host-static configuration under ``jax.jit``;
+        close over it or mark it as a static argument.
+    rank_chunk_size : int, optional
+        Number of retained decomposition ranks to process per reciprocal-space transform.
+        ``None`` and values at least the retained rank use the unchunked path. Smaller
+        positive values process contiguous rank slices and are host-static under ``jax.jit``.
 
     Returns
     -------
@@ -363,6 +423,8 @@ def fourier_dftd3(
     virial : jax.Array, shape (num_systems, 3, 3)
         Returned only when ``compute_virial`` is set. This is ``dE/d(strain)``.
     """
+    exact_moduli = _validate_exact_moduli(exact_moduli)
+    rank_chunk_size = _validate_rank_chunk_size(rank_chunk_size)
     matrix_given = neighbor_matrix is not None
     list_given = neighbor_list is not None
     if matrix_given and list_given:
@@ -417,8 +479,18 @@ def fourier_dftd3(
         n_atoms,
     )
 
-    mesh_nx, mesh_ny, mesh_nz = _resolve_mesh(mesh_dimensions, mesh_spacing, cells)
+    mesh_nx, mesh_ny, mesh_nz = _resolve_mesh(
+        mesh_dimensions, mesh_spacing, cells, spline_order
+    )
     n_species, rank = params.n_species, params.rank
+    if n_atoms == 0:
+        empty_energy = jnp.zeros(num_systems, dtype=dtype)
+        empty_forces = jnp.zeros((0, 3), dtype=dtype)
+        if compute_virial:
+            empty_virial = jnp.zeros((num_systems, 3, 3), dtype=dtype)
+            return empty_energy, empty_forces, empty_virial
+        return empty_energy, empty_forces
+
     n_groups = num_systems * n_species
 
     group_idx = (batch_idx * n_species + species_index).astype(jnp.int32)
@@ -481,88 +553,189 @@ def fourier_dftd3(
         output_dims={"c6": (n_atoms, rank), "dc6_dcn": (n_atoms, rank)},
     )
 
-    # Pass 3: spread onto the (system, species, rank) mesh.
-    mesh = jnp.zeros((n_groups * rank, mesh_nx, mesh_ny, mesh_nz), dtype=dtype)
-    (mesh,) = _spread_kernels[dtype](
-        positions,
-        c6,
-        group_idx,
-        cell_inv_grouped,
-        int(spline_order),
-        int(rank),
-        mesh,
-        launch_dims=(n_atoms, spline_order**3),
-    )
+    if rank_chunk_size is None or rank_chunk_size >= rank:
+        # Pass 3: spread onto the (system, species, rank) mesh.
+        mesh = jnp.zeros((n_groups * rank, mesh_nx, mesh_ny, mesh_nz), dtype=dtype)
+        (mesh,) = _spread_kernels[dtype](
+            positions,
+            c6,
+            group_idx,
+            cell_inv_grouped,
+            int(spline_order),
+            int(rank),
+            mesh,
+            launch_dims=(n_atoms, spline_order**3),
+        )
 
-    # Pass 4: forward transform.
-    mesh_fft = jnp.fft.rfftn(mesh, axes=(-3, -2, -1))
-    mesh_fft_pairs = jnp.stack([mesh_fft.real, mesh_fft.imag], axis=-1).astype(dtype)
+        # Pass 4: forward transform.
+        mesh_fft = jnp.fft.rfftn(mesh, axes=(-3, -2, -1))
+        mesh_fft_pairs = jnp.stack([mesh_fft.real, mesh_fft.imag], axis=-1).astype(
+            dtype
+        )
 
-    miller_x = jnp.fft.fftfreq(mesh_nx, d=1.0 / mesh_nx).astype(dtype)
-    miller_y = jnp.fft.fftfreq(mesh_ny, d=1.0 / mesh_ny).astype(dtype)
-    miller_z = jnp.fft.rfftfreq(mesh_nz, d=1.0 / mesh_nz).astype(dtype)
-    moduli = [
-        _bspline_moduli(m, n, spline_order, dtype)
-        for m, n in ((miller_x, mesh_nx), (miller_y, mesh_ny), (miller_z, mesh_nz))
-    ]
-    volumes = jnp.abs(jnp.linalg.det(cells)).astype(dtype)
-    k_matrix = (2.0 * jnp.pi * jnp.linalg.inv(cells)).astype(dtype)
+        miller_x = jnp.fft.fftfreq(mesh_nx, d=1.0 / mesh_nx).astype(dtype)
+        miller_y = jnp.fft.fftfreq(mesh_ny, d=1.0 / mesh_ny).astype(dtype)
+        miller_z = jnp.fft.rfftfreq(mesh_nz, d=1.0 / mesh_nz).astype(dtype)
+        moduli = [
+            _bspline_moduli(m, n, spline_order, exact_moduli, dtype)
+            for m, n in ((miller_x, mesh_nx), (miller_y, mesh_ny), (miller_z, mesh_nz))
+        ]
+        volumes = jnp.abs(jnp.linalg.det(cells)).astype(dtype)
+        k_matrix = (2.0 * jnp.pi * jnp.linalg.inv(cells)).astype(dtype)
 
-    # Pass 5: reciprocal-space contraction. The bin count is padded so that a block of the
-    # reduction never spans two systems.
-    num_bins = mesh_nx * mesh_ny * (mesh_nz // 2 + 1)
-    padded_bins = -(-num_bins // FD3_KSPACE_BLOCK_SIZE) * FD3_KSPACE_BLOCK_SIZE
-    energy_init = jnp.zeros(num_systems, dtype=dtype)
-    virial_init = jnp.zeros((num_systems, 3, 3), dtype=dtype)
-    cotangent_init = jnp.zeros_like(mesh_fft_pairs)
-    energy, cotangent, virial = _kspace_kernels[dtype](
-        mesh_fft_pairs,
-        k_matrix,
-        moduli[0],
-        moduli[1],
-        moduli[2],
-        volumes,
-        sqrt_q,
-        eigs,
-        float(s6),
-        float(s8),
-        float(a1),
-        float(a2),
-        int(mesh_nx),
-        int(mesh_ny),
-        int(mesh_nz),
-        int(num_bins),
-        int(FD3_KSPACE_BLOCK_SIZE),
-        int(n_species),
-        int(rank),
-        bool(compute_virial),
-        energy_init,
-        cotangent_init,
-        virial_init,
-        launch_dims=(num_systems, padded_bins),
-    )
+        # Pass 5: reciprocal-space contraction. The bin count is padded so that a block of the
+        # reduction never spans two systems.
+        num_bins = mesh_nx * mesh_ny * (mesh_nz // 2 + 1)
+        padded_bins = -(-num_bins // FD3_KSPACE_BLOCK_SIZE) * FD3_KSPACE_BLOCK_SIZE
+        energy_init = jnp.zeros(num_systems, dtype=dtype)
+        virial_init = jnp.zeros((num_systems, 3, 3), dtype=dtype)
+        cotangent_init = jnp.zeros_like(mesh_fft_pairs)
+        energy, cotangent, virial = _kspace_kernels[dtype](
+            mesh_fft_pairs,
+            k_matrix,
+            moduli[0],
+            moduli[1],
+            moduli[2],
+            volumes,
+            sqrt_q,
+            eigs,
+            float(s6),
+            float(s8),
+            float(a1),
+            float(a2),
+            int(mesh_nx),
+            int(mesh_ny),
+            int(mesh_nz),
+            int(num_bins),
+            int(FD3_KSPACE_BLOCK_SIZE),
+            int(n_species),
+            int(rank),
+            bool(compute_virial),
+            energy_init,
+            cotangent_init,
+            virial_init,
+            launch_dims=(num_systems, padded_bins),
+        )
 
-    # Pass 6: inverse transform, unnormalised so that it is the adjoint of the forward one.
-    potential = jnp.fft.irfftn(
-        cotangent[..., 0] + 1j * cotangent[..., 1],
-        s=(mesh_nx, mesh_ny, mesh_nz),
-        axes=(-3, -2, -1),
-        norm="forward",
-    ).astype(dtype)
+        # Pass 6: inverse transform, unnormalised so that it is the adjoint of the forward one.
+        potential = jnp.fft.irfftn(
+            cotangent[..., 0] + 1j * cotangent[..., 1],
+            s=(mesh_nx, mesh_ny, mesh_nz),
+            axes=(-3, -2, -1),
+            norm="forward",
+        ).astype(dtype)
 
-    # Pass 7: gather the coefficient derivative and the direct mesh force.
-    d_energy_d_c6, forces = _gather_kernels[dtype](
-        potential,
-        positions,
-        c6,
-        group_idx,
-        cell_inv_grouped,
-        int(spline_order),
-        int(rank),
-        jnp.zeros((n_atoms, rank), dtype=dtype),
-        jnp.zeros((n_atoms, 3), dtype=dtype),
-        launch_dims=(n_atoms,),
-    )
+        # Pass 7: gather the coefficient derivative and the direct mesh force.
+        d_energy_d_c6, forces = _gather_kernels[dtype](
+            potential,
+            positions,
+            c6,
+            group_idx,
+            cell_inv_grouped,
+            int(spline_order),
+            int(rank),
+            jnp.zeros((n_atoms, rank), dtype=dtype),
+            jnp.zeros((n_atoms, 3), dtype=dtype),
+            launch_dims=(n_atoms,),
+        )
+    else:
+        # Chunking is intentionally unrolled at trace time: every slice has a static width,
+        # including the final non-divisible remainder.
+        miller_x = jnp.fft.fftfreq(mesh_nx, d=1.0 / mesh_nx).astype(dtype)
+        miller_y = jnp.fft.fftfreq(mesh_ny, d=1.0 / mesh_ny).astype(dtype)
+        miller_z = jnp.fft.rfftfreq(mesh_nz, d=1.0 / mesh_nz).astype(dtype)
+        moduli = [
+            _bspline_moduli(m, n, spline_order, exact_moduli, dtype)
+            for m, n in ((miller_x, mesh_nx), (miller_y, mesh_ny), (miller_z, mesh_nz))
+        ]
+        volumes = jnp.abs(jnp.linalg.det(cells)).astype(dtype)
+        k_matrix = (2.0 * jnp.pi * jnp.linalg.inv(cells)).astype(dtype)
+        num_bins = mesh_nx * mesh_ny * (mesh_nz // 2 + 1)
+        padded_bins = -(-num_bins // FD3_KSPACE_BLOCK_SIZE) * FD3_KSPACE_BLOCK_SIZE
+        energy = jnp.zeros(num_systems, dtype=dtype)
+        forces = jnp.zeros((n_atoms, 3), dtype=dtype)
+        virial = jnp.zeros((num_systems, 3, 3), dtype=dtype)
+        d_energy_d_c6_slices = []
+
+        for start in range(0, rank, rank_chunk_size):
+            stop = min(start + rank_chunk_size, rank)
+            chunk_rank = stop - start
+            c6_chunk = c6[:, start:stop]
+            eigs_chunk = eigs[start:stop]
+
+            mesh = jnp.zeros(
+                (n_groups * chunk_rank, mesh_nx, mesh_ny, mesh_nz), dtype=dtype
+            )
+            (mesh,) = _spread_kernels[dtype](
+                positions,
+                c6_chunk,
+                group_idx,
+                cell_inv_grouped,
+                int(spline_order),
+                int(chunk_rank),
+                mesh,
+                launch_dims=(n_atoms, spline_order**3),
+            )
+            mesh_fft = jnp.fft.rfftn(mesh, axes=(-3, -2, -1))
+            mesh_fft_pairs = jnp.stack([mesh_fft.real, mesh_fft.imag], axis=-1).astype(
+                dtype
+            )
+
+            chunk_energy = jnp.zeros(num_systems, dtype=dtype)
+            chunk_virial = jnp.zeros((num_systems, 3, 3), dtype=dtype)
+            cotangent = jnp.zeros_like(mesh_fft_pairs)
+            chunk_energy, cotangent, chunk_virial = _kspace_kernels[dtype](
+                mesh_fft_pairs,
+                k_matrix,
+                moduli[0],
+                moduli[1],
+                moduli[2],
+                volumes,
+                sqrt_q,
+                eigs_chunk,
+                float(s6),
+                float(s8),
+                float(a1),
+                float(a2),
+                int(mesh_nx),
+                int(mesh_ny),
+                int(mesh_nz),
+                int(num_bins),
+                int(FD3_KSPACE_BLOCK_SIZE),
+                int(n_species),
+                int(chunk_rank),
+                bool(compute_virial),
+                chunk_energy,
+                cotangent,
+                chunk_virial,
+                launch_dims=(num_systems, padded_bins),
+            )
+            potential = jnp.fft.irfftn(
+                cotangent[..., 0] + 1j * cotangent[..., 1],
+                s=(mesh_nx, mesh_ny, mesh_nz),
+                axes=(-3, -2, -1),
+                norm="forward",
+            ).astype(dtype)
+            d_energy_d_c6_chunk = jnp.zeros((n_atoms, chunk_rank), dtype=dtype)
+            chunk_forces = jnp.zeros((n_atoms, 3), dtype=dtype)
+            d_energy_d_c6_chunk, chunk_forces = _gather_kernels[dtype](
+                potential,
+                positions,
+                c6_chunk,
+                group_idx,
+                cell_inv_grouped,
+                int(spline_order),
+                int(chunk_rank),
+                d_energy_d_c6_chunk,
+                chunk_forces,
+                launch_dims=(n_atoms,),
+            )
+            energy = energy + chunk_energy
+            forces = forces + chunk_forces
+            virial = virial + chunk_virial
+            d_energy_d_c6_slices.append(d_energy_d_c6_chunk)
+
+        d_energy_d_c6 = jnp.concatenate(d_energy_d_c6_slices, axis=1)
 
     # Pass 8: self-energy, before the chain rule.
     energy, d_energy_d_c6 = _self_energy_kernels[dtype](
@@ -636,13 +809,16 @@ def _cardinal_bspline(u, order):
     return (u * lower + (float(order) - u) * shifted) / float(order - 1)
 
 
-def _bspline_moduli(miller, mesh_size, spline_order, dtype):
+def _bspline_moduli(miller, mesh_size, spline_order, exact, dtype):
     """Discrete B-spline attenuation for one mesh axis.
 
     The magnitude of the DFT of the spline coefficients, which is what interpolation on a
     finite mesh actually applies. The Nyquist bin of an even mesh can vanish, which would
     divide by zero during deconvolution, so it is replaced by the mean of its neighbours.
     """
+    if not exact:
+        return (jnp.sinc(miller / mesh_size) ** spline_order).astype(dtype)
+
     nodes = jnp.arange(spline_order, dtype=dtype) + 1.0
     coefficients = (
         jnp.zeros(mesh_size, dtype=dtype)

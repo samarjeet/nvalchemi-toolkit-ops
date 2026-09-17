@@ -683,9 +683,9 @@ def _fd3_kspace_kernel(
     Modifies
     --------
     ``energy[b]`` and, when requested, ``virial[b]`` are accumulated once per block.
-    ``cotangent`` is overwritten at this bin for every channel. The multiplicity weight
-    applies to the reductions only; the cotangent is left unweighted because the inverse
-    transform restores the unstored half itself.
+    ``cotangent`` is accumulated at this bin for every channel and must be zero-initialized.
+    The Hermitian half-spectrum weight applies to the reductions only; the cotangent is left
+    unweighted because the inverse transform restores the unstored half itself.
 
     Notes
     -----
@@ -728,39 +728,53 @@ def _fd3_kspace_kernel(
     accumulated = zero
     accumulated_slope = zero
 
-    for slot in range(rank):
-        for species_a in range(n_species):
-            channel_a = (system * n_species + species_a) * rank + slot
-            amplitude_a = mesh_fft[channel_a, ix, iy, iz] / modulus
-
-            response = wp.vector(zero, zero)
-            response_slope = wp.vector(zero, zero)
-            for species_b in range(n_species):
-                channel_b = (system * n_species + species_b) * rank + slot
+    for species_a in range(n_species):
+        for species_b in range(species_a, n_species):
+            multiplicity = unit if species_a == species_b else unit + unit
+            channel_a_base = (system * n_species + species_a) * rank
+            channel_b_base = (system * n_species + species_b) * rank
+            for slot in range(rank):
+                channel_a = channel_a_base + slot
+                channel_b = channel_b_base + slot
+                amplitude_a = mesh_fft[channel_a, ix, iy, iz] / modulus
                 amplitude_b = mesh_fft[channel_b, ix, iy, iz] / modulus
                 q_product = sqrt_q[species_a] * sqrt_q[species_b]
                 r0 = a1 * wp.sqrt(type(s6)(3.0) * q_product) + a2
                 value, slope = _reciprocal_kernel(k_norm, r0, q_product, s6, s8)
-                response += value * amplitude_b
-                if compute_virial:
-                    response_slope += slope * amplitude_b
-
-            response *= eigs[slot]
-            accumulated += weight * (
-                amplitude_a[0] * response[0] + amplitude_a[1] * response[1]
-            )
-            if compute_virial:
-                response_slope *= eigs[slot]
-                accumulated_slope += weight * (
-                    amplitude_a[0] * response_slope[0]
-                    + amplitude_a[1] * response_slope[1]
+                eig_value = eigs[slot] * value
+                accumulated += (
+                    multiplicity
+                    * weight
+                    * eig_value
+                    * (
+                        amplitude_a[0] * amplitude_b[0]
+                        + amplitude_a[1] * amplitude_b[1]
+                    )
                 )
-            # dE/d(mesh) follows from the inverse transform of this field, so it carries the
-            # prefactor and the remaining spline factor but not the multiplicity.
-            if active:
-                cotangent[channel_a, ix, iy, iz] = (
-                    type(s6)(2.0) * prefactor / modulus
-                ) * response
+                if compute_virial:
+                    eig_slope = eigs[slot] * slope
+                    accumulated_slope += (
+                        multiplicity
+                        * weight
+                        * eig_slope
+                        * (
+                            amplitude_a[0] * amplitude_b[0]
+                            + amplitude_a[1] * amplitude_b[1]
+                        )
+                    )
+                # dE/d(mesh) follows from the inverse transform of this field, so it carries
+                # the prefactor and the remaining spline factor but not the half-spectrum
+                # weight.
+                if active:
+                    cotangent[channel_a, ix, iy, iz] += (
+                        (type(s6)(2.0) * prefactor / modulus) * eig_value * amplitude_b
+                    )
+                    if species_a != species_b:
+                        cotangent[channel_b, ix, iy, iz] += (
+                            (type(s6)(2.0) * prefactor / modulus)
+                            * eig_value
+                            * amplitude_a
+                        )
 
     contribution = wp.where(active, prefactor * accumulated, zero)
     # The launch block size, not the constant: on CPU a block is one thread, and
@@ -1132,7 +1146,7 @@ def fd3_kspace(
         OUTPUT: accumulated reciprocal-space energy. Must be zero-initialised.
     cotangent : wp.array4d
         OUTPUT: field whose inverse transform, taken with an unnormalised convention, is
-        ``dE/d(mesh)``. Same shape and dtype as ``mesh_fft``; fully overwritten.
+        ``dE/d(mesh)``. Same shape and dtype as ``mesh_fft``; must be zero-initialised.
     virial : wp.array, shape (B,), dtype=wp.mat33f or wp.mat33d
         IN-OUT: the reciprocal-space strain derivative is accumulated when
         ``compute_virial`` is set. Must be zero-initialised.
@@ -1386,7 +1400,7 @@ def _fd3_gather_and_force_kernel(
         gz = wrap_grid_index(base_grid[2] + offset[2], mesh_dims[2])
 
         # Fractional-space gradients become Cartesian through the inverse cell.
-        cartesian = cell_inv_t[group] * gradient
+        cartesian = wp.transpose(cell_inv_t[group]) * gradient
 
         for slot in range(rank):
             value = potential[group * rank + slot, gx, gy, gz]
