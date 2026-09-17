@@ -449,124 +449,168 @@ fire2_step_coord_cell(
 ### L-BFGS (Limited-memory Quasi-Newton)
 
 L-BFGS builds an implicit approximation to the inverse Hessian from the last
-few position and gradient differences and uses it to pick a search direction,
-then chooses a step length with a strong Wolfe line search. It usually reaches
-a given force tolerance in far fewer energy/force evaluations than FIRE or
-FIRE2 — the cost that dominates relaxation with a machine-learned potential.
+few position and gradient differences. Its public lifecycle matches FIRE2:
+the caller evaluates the model, checks convergence, invokes one optimizer step,
+and validates the resulting proposal before the next model evaluation.
 
-**Choosing between FIRE2 and L-BFGS.** FIRE2 costs one force evaluation per
-step and carries almost no state, which makes it a good fit for very large
-systems or for starting geometries far from any minimum. L-BFGS spends more
-memory (`2 * m` history vectors) and may take several evaluations in a single
-iteration while the line search settles, but converges in fewer evaluations
-overall on smooth potentials. If your force evaluation is expensive relative to
-a handful of microseconds of kernel time, prefer L-BFGS.
+Use `prepare_lbfgs_state` for fixed-cell relaxation and
+`prepare_lbfgs_cell_state` for variable-cell relaxation. The returned state
+objects own the persistent history and required scratch arrays; pass the same
+state back on each step while the system and atom ordering remain unchanged.
+The Core and PyTorch functions update positions and state in place. JAX returns
+updated positions and state, and requires `jax_enable_x64=True` because the
+canonical reductions and recursion coefficients are float64.
 
-**You own the buffers.** The optimizer allocates nothing, initializes nothing
-and keeps no hidden state between calls. You allocate the 26 buffers once and
-pass them to every step, which means a step allocates no memory and the arrays
-can come from whatever pool you already have.
+`lbfgs_step_coord` accepts evaluated Cartesian forces.
+`lbfgs_step_coord_cell` additionally accepts the raw cell force produced by
+`stress_to_cell_force`. Both functions start from a unit L-BFGS step and reduce
+it only as needed so the computed displacement is at most the caller-selected
+`maxstep`. Adding that displacement in the coordinate dtype may differ by its
+rounding error, which is observable for float32 coordinates with very large
+absolute values. The variable-cell cap includes displacement caused by coupled
+atom and cell motion.
 
-Zero every buffer, then set exactly three:
+Systems are identified by a sorted, contiguous `batch_idx`. The cell-state
+allocator derives the packed topology and atom-count scaling from that input,
+including for ragged batches. If systems are removed, reordered, or refilled,
+the caller must gather or reset the corresponding state, or prepare new state.
+The caller also owns convergence tests, cell validity checks, checkpoints, and
+recovery from an invalid proposal; L-BFGS does not assign terminal statuses or
+run an optimization loop.
 
-| Buffer | Initial value |
-| --- | --- |
-| `alpha_step` | `1.0` — the line-search step length for a new direction |
-| `iteration` | `-1` — the "never evaluated" marker |
-| `status` | `LBFGS_NEED_EVAL`, which is numerically zero |
+#### State layout
 
-That is the whole of initialization, and repeating it is how you restart a
-relaxation. See the `nvalchemiops.dynamics.optimizers.lbfgs` module
-documentation for the shapes; briefly, with `P` degrees of freedom, `M` systems
-and history size `m`: `x_base`, `force_base` and `direction` are `(P,)` vectors,
-`s_history` and `y_history` are `(m, P)`, `ys`/`yy`/`alpha_hist`/`beta_hist` are
-`(m, M)` float64, `ss` through `alpha_step` are `(M,)` float64, and `status`
-through `history_count` are `(M,)` int32. The per-system scalars stay float64
-whatever precision the coordinates use.
+`LBFGSState` exposes the arrays needed to retain one independent history per
+system. Here, `N` is the number of coordinate rows, `M` is the number of
+systems, and `m` is the requested history size. The table uses the logical
+Torch/JAX vector shapes; Core Warp represents each logical `(N, 3)` vector
+array as an `(N,)` array of three-component vectors.
 
-**You own the loop.** Each `lbfgs_step` call consumes exactly one energy/force
-evaluation. Inspect `status` to decide when to stop:
+| Field | Shape | Dtype | Purpose |
+| --- | --- | --- | --- |
+| `x_base`, `force_base`, `direction` | `(N, 3)` | coordinate dtype | Accepted base and current direction |
+| `s_history`, `y_history` | `(m, N, 3)` | coordinate dtype | Curvature-pair ring |
+| `ys`, `yy`, `two_loop_alpha` | `(m, M)` | float64 | Reductions and two-loop coefficients |
+| `initialized`, `history_end`, `history_count` | `(M,)` | int32 | Per-system ring control |
+
+`LBFGSCellState` contains an `LBFGSState` for `N + 2M` packed rows, plus the
+reference cell, atom-count scaling, extended topology, and packing scratch.
+Preparation captures the reference cell and fixed atom-to-system topology.
+Changing the membership or order of a batch therefore requires matching state
+gathering or a newly prepared state.
+
+Optimizer history, control, and scratch arrays are initialized to zero. Cell
+state additionally stores the prepared reference geometry, scaling, and
+topology. A finite zero-force system records its base and produces no motion.
+Coordinate arrays and history may be float32 or float64; dot products and
+recursion coefficients are accumulated in float64. Curvature rejection and
+non-descent directions clear only the affected system's history and restart
+from its normalized current force.
+
+#### Fixed-cell caller loop
 
 ```python
-import numpy as np
-import warp as wp
-from nvalchemiops.dynamics.optimizers import (
-    LBFGS_NEED_EVAL,
-    lbfgs_reduce_energy,
-    lbfgs_step,
+import torch
+
+from nvalchemiops.torch.lbfgs import lbfgs_step_coord, prepare_lbfgs_state
+
+positions = torch.tensor(
+    [[1.0, -0.5, 0.25], [-0.75, 0.4, -0.2]],
+    dtype=torch.float32,
+    device="cuda",
 )
+batch_idx = torch.zeros(len(positions), dtype=torch.int32, device=positions.device)
+state = prepare_lbfgs_state(positions, num_systems=1, history_size=6)
 
-# `buffers` is your own dict of the 26 arrays, in the canonical order.
-buffers["alpha_step"].fill_(1.0)
-buffers["iteration"].fill_(-1)
-buffers["status"].fill_(LBFGS_NEED_EVAL)
-status = buffers["status"]
-
-while True:
-    per_atom_energy, forces = model(positions)
-    lbfgs_reduce_energy(per_atom_energy, batch_idx, energy)
-    lbfgs_step(
-        positions=positions,
-        forces=forces,
-        energy=energy,
-        batch_idx=batch_idx,
-        n_particles=n_particles,
-        force_tol=0.05,   # eV/A, on the largest per-atom force
-        maxstep=0.2,      # A, largest displacement in one step
-        **buffers,
-    )
-    if not (status.numpy() == LBFGS_NEED_EVAL).any():
+for _ in range(500):
+    # Replace this analytic force with a model evaluation at `positions`.
+    forces = -positions
+    if torch.linalg.vector_norm(forces, dim=1).max().item() < 2.0e-3:
         break
+
+    lbfgs_step_coord(positions, forces, batch_idx, state, maxstep=0.2)
+    if not torch.isfinite(positions).all():
+        raise RuntimeError("L-BFGS proposed nonfinite coordinates")
+else:
+    raise RuntimeError("relaxation reached its caller-selected evaluation cap")
 ```
 
-The PyTorch binding takes the same buffers positionally and mutates them in
-place; the JAX binding takes them individually and returns them as a flat tuple
-in the same order, since JAX arrays are immutable.
+The convergence test precedes each step because the supplied forces belong to
+the current geometry. A production loop must also rebuild geometry-dependent
+model inputs before evaluating the proposal.
 
-`status` takes three values per system:
+#### Variable-cell caller loop
 
-| Value | Meaning |
-| --- | --- |
-| `LBFGS_NEED_EVAL` | Keep going; `positions` hold a new trial point. |
-| `LBFGS_CONVERGED` | Done; `positions` hold the relaxed geometry. |
-| `LBFGS_LS_FAILED` | The line search stalled. `positions` were restored to the last accepted point. |
+Prepare cell state once from an aligned cell and sorted `batch_idx`:
 
-`LBFGS_LS_FAILED` is not a convergence claim. If you consider a stalled search
-with acceptably small forces to be a success, apply that policy yourself from
-`status` and `force_base`.
+```python
+from nvalchemiops.torch.lbfgs import (
+    lbfgs_step_coord_cell,
+    prepare_lbfgs_cell_state,
+)
 
-**Use `force_base`, not your own `forces`, after a failure.** `forces` is an
-input and is never written back, so it still holds what your model returned at
-the *rejected* trial, while `LBFGS_LS_FAILED` has moved `positions` back to the
-last accepted point — the two no longer describe the same geometry. `force_base`
-is written alongside `x_base` at every accepted point, so `(positions,
-force_base)` is the consistent pair on any terminal status. Alternatively,
-evaluate your model once more at the restored `positions`. `LBFGS_CONVERGED`
-has no such hazard: positions are not moved when it is decided.
+state = prepare_lbfgs_cell_state(
+    positions,
+    cell,
+    batch_idx,
+    history_size=6,
+    cell_force_scale=1.0,
+)
 
-**Batching.** Systems are identified by a sorted `batch_idx` and relax
-independently: each runs its own line search and keeps its own history, and
-systems that finish early are skipped by the remaining kernels. Note that
-`n_particles` is the atom count per system, used by the optional RMS
-convergence criterion.
+# Inside the caller-owned optimization loop, after evaluating the model:
+lbfgs_step_coord_cell(
+    positions,
+    forces,
+    cell,
+    cell_force,  # raw output of stress_to_cell_force(...)
+    batch_idx,
+    state,
+    maxstep=0.2,
+)
 
-**Supplying energy.** Pass per-atom energies through `lbfgs_reduce_energy`
-rather than summing them yourself in single precision. The Armijo test compares
-a difference of *total* energies, and at `E ~ -1e4 eV` a float32 total is
-rounded to about `1e-3 eV` — enough to make the line search unreliable near
-convergence. Summing per-atom values in float64 avoids this.
+if not torch.isfinite(positions).all() or not torch.isfinite(cell).all():
+    raise RuntimeError("nonfinite L-BFGS proposal")
+if torch.linalg.det(cell).min().item() <= 0.0:
+    raise RuntimeError("L-BFGS proposed a non-positive cell")
+```
 
-**Variable cell.** The packed layout interleaves each system's atoms with its
-two cell entries, so the buffers must be sized for `num_atoms + 2 * num_systems`
-degrees of freedom. Build `ext_atom_ptr` and `ext_batch_idx` with the generic
-`extend_atom_ptr` and `atom_ptr_to_batch_idx` utilities; because nothing
-assumes a uniform split, ragged batches whose systems have different atom
-counts work the same way uniform ones do. Call `lbfgs_set_reference_cell` and
-`lbfgs_cell_kappa` once, before the first step.
+The operator normalizes raw cell force by `atoms_per_system *
+cell_force_scale`, as FIRE2 does. It limits realized per-atom Cartesian motion,
+including affine motion caused by the cell update; it does not impose a strain
+limit or decide whether a cell is physically acceptable. Checkpoint and restore
+both geometry and matching optimizer state if the surrounding application wants
+to recover from a rejected proposal.
 
-**Memory.** The history dominates: `2 * m` vectors of `num_dofs` each. At
-`m = 6` and float32 coordinates that is roughly `192` bytes per degree of
-freedom. Reduce `m` if memory is tight; `m` between 3 and 7 is typical.
+For JAX, enable float64 before preparing state. The functional call returns
+updated geometry and state:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from nvalchemiops.jax.lbfgs import lbfgs_step_coord, prepare_lbfgs_state
+
+jax.config.update("jax_enable_x64", True)
+positions = jnp.asarray([[1.0, -0.5, 0.25]], dtype=jnp.float32)
+forces = -positions
+batch_idx = jnp.zeros(len(positions), dtype=jnp.int32)
+state = prepare_lbfgs_state(positions, num_systems=1, history_size=6)
+positions, state = lbfgs_step_coord(positions, forces, batch_idx, state)
+```
+
+When JIT-compiling a repeated loop, donate the returned geometry and complete
+state together. The variable-cell allocator keeps its reference cell in
+independent storage so the current cell and state can both be donated.
+
+#### Qualification scope
+
+The implementation was qualified for convergence behavior on the native
+120-structure, 2,278-atom OMat24 example sample with compiled float32
+MACE-MPA-0 and cuEquivariance, for fixed and variable cells at force tolerances
+of 0.02 and 0.002 eV/Å. This qualification is not a timing result and does not
+establish approximately-30,000-atom scaling. Variable-cell long-tail behavior
+is sensitive to float32 numerical variation, so applications should retain
+explicit evaluation caps and independently verify terminal geometries.
 
 ## Temperature Control Utilities
 
