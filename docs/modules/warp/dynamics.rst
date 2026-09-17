@@ -131,11 +131,17 @@ forces (and raw cell force for cell relaxation) and proposes the next geometry.
 .. note::
    Use :func:`~nvalchemiops.dynamics.optimizers.lbfgs.prepare_lbfgs_state` or
    :func:`~nvalchemiops.dynamics.optimizers.lbfgs.prepare_lbfgs_cell_state` to
-   create explicit caller-owned state.
+   create explicit caller-owned state. The caller evaluates forces, checks
+   convergence, maintains batch/state alignment, validates proposals, and owns
+   the surrounding loop.
 
 Variable-cell relaxation maps positions and cell into a single packed
 coordinate vector, so the two-loop recursion couples them automatically.
 The cell-state allocator derives and stores the extended topology from the sorted ``batch_idx`` input.
+The step consumes raw cell force from
+:func:`~nvalchemiops.dynamics.utils.cell_filter.stress_to_cell_force` and applies
+the same atom-count scaling convention as FIRE2. It caps realized Cartesian
+atom motion but does not validate cell feasibility or assign terminal status.
 
 .. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.prepare_lbfgs_state
 .. autofunction:: nvalchemiops.dynamics.optimizers.lbfgs.prepare_lbfgs_cell_state

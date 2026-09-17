@@ -49,13 +49,17 @@ and proposes the next geometry through explicit caller-owned state.
 
 .. note::
    Use ``prepare_lbfgs_state`` or ``prepare_lbfgs_cell_state`` to create the
-   state passed to every step.
+   state passed to every step. Positions, cell, and state are mutated in place.
+   The caller checks convergence before stepping and owns batch refill,
+   proposal validation, checkpointing, and the surrounding loop.
 
 .. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_step_coord
 
 Variable-cell relaxation maps coordinates and cell into one packed coordinate
 vector, so the two-loop recursion couples them automatically.
 The cell-state allocator derives and stores the extended topology from the sorted ``batch_idx`` input.
+The cell step accepts raw cell force from ``stress_to_cell_force`` and limits
+realized per-atom Cartesian displacement, including coupled cell motion.
 
 .. autofunction:: nvalchemiops.torch.lbfgs.prepare_lbfgs_state
 .. autofunction:: nvalchemiops.torch.lbfgs.prepare_lbfgs_cell_state

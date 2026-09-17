@@ -11,7 +11,8 @@
   history and scratch arrays. Coordinate and variable-cell steps consume
   evaluated forces or forces and raw cell force, update the history, and apply
   one caller-capped proposal. The caller owns convergence, active-batch refill,
-  checkpoints, and cell validation.
+  checkpoints, and cell validation. Variable-cell proposals enforce the cap on
+  realized per-atom Cartesian motion, including coupled affine cell motion.
 
 ## v0.4.1 - 2026-08-03
 

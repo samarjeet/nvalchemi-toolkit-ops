@@ -93,6 +93,20 @@ Geometry Optimization Examples
     - Preserves fractional coordinates during cell-only motion
     - Simpler state than FIRE (no masses, fewer per-system arrays)
 
+12_lbfgs_optimization.py
+    Caller-owned fixed-cell L-BFGS relaxation of a quadratic system.
+
+    - Explicit history allocation
+    - Convergence checked before every single-step update
+    - Caller-selected Cartesian displacement cap
+
+13_lbfgs_variable_cell.py
+    Caller-owned variable-cell L-BFGS relaxation of an analytic cell target.
+
+    - Raw cell-force input and atom-count scaling
+    - Coupled cell/coordinate state preparation
+    - Caller-side finite and positive-cell validation
+
 Key Concepts
 ------------
 

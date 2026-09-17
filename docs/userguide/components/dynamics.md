@@ -464,9 +464,11 @@ canonical reductions and recursion coefficients are float64.
 `lbfgs_step_coord` accepts evaluated Cartesian forces.
 `lbfgs_step_coord_cell` additionally accepts the raw cell force produced by
 `stress_to_cell_force`. Both functions start from a unit L-BFGS step and reduce
-it only as needed so no atom moves farther than the caller-selected `maxstep`.
-The variable-cell cap includes displacement caused by coupled atom and cell
-motion.
+it only as needed so the computed displacement is at most the caller-selected
+`maxstep`. Adding that displacement in the coordinate dtype may differ by its
+rounding error, which is observable for float32 coordinates with very large
+absolute values. The variable-cell cap includes displacement caused by coupled
+atom and cell motion.
 
 Systems are identified by a sorted, contiguous `batch_idx`. The cell-state
 allocator derives the packed topology and atom-count scaling from that input,
@@ -475,6 +477,140 @@ the caller must gather or reset the corresponding state, or prepare new state.
 The caller also owns convergence tests, cell validity checks, checkpoints, and
 recovery from an invalid proposal; L-BFGS does not assign terminal statuses or
 run an optimization loop.
+
+#### State layout
+
+`LBFGSState` exposes the arrays needed to retain one independent history per
+system. Here, `N` is the number of coordinate rows, `M` is the number of
+systems, and `m` is the requested history size. The table uses the logical
+Torch/JAX vector shapes; Core Warp represents each logical `(N, 3)` vector
+array as an `(N,)` array of three-component vectors.
+
+| Field | Shape | Dtype | Purpose |
+| --- | --- | --- | --- |
+| `x_base`, `force_base`, `direction` | `(N, 3)` | coordinate dtype | Accepted base and current direction |
+| `s_history`, `y_history` | `(m, N, 3)` | coordinate dtype | Curvature-pair ring |
+| `ys`, `yy`, `two_loop_alpha` | `(m, M)` | float64 | Reductions and two-loop coefficients |
+| `initialized`, `history_end`, `history_count` | `(M,)` | int32 | Per-system ring control |
+
+`LBFGSCellState` contains an `LBFGSState` for `N + 2M` packed rows, plus the
+reference cell, atom-count scaling, extended topology, and packing scratch.
+Preparation captures the reference cell and fixed atom-to-system topology.
+Changing the membership or order of a batch therefore requires matching state
+gathering or a newly prepared state.
+
+Optimizer history, control, and scratch arrays are initialized to zero. Cell
+state additionally stores the prepared reference geometry, scaling, and
+topology. A finite zero-force system records its base and produces no motion.
+Coordinate arrays and history may be float32 or float64; dot products and
+recursion coefficients are accumulated in float64. Curvature rejection and
+non-descent directions clear only the affected system's history and restart
+from its normalized current force.
+
+#### Fixed-cell caller loop
+
+```python
+import torch
+
+from nvalchemiops.torch.lbfgs import lbfgs_step_coord, prepare_lbfgs_state
+
+positions = torch.tensor(
+    [[1.0, -0.5, 0.25], [-0.75, 0.4, -0.2]],
+    dtype=torch.float32,
+    device="cuda",
+)
+batch_idx = torch.zeros(len(positions), dtype=torch.int32, device=positions.device)
+state = prepare_lbfgs_state(positions, num_systems=1, history_size=6)
+
+for _ in range(500):
+    # Replace this analytic force with a model evaluation at `positions`.
+    forces = -positions
+    if torch.linalg.vector_norm(forces, dim=1).max().item() < 2.0e-3:
+        break
+
+    lbfgs_step_coord(positions, forces, batch_idx, state, maxstep=0.2)
+    if not torch.isfinite(positions).all():
+        raise RuntimeError("L-BFGS proposed nonfinite coordinates")
+else:
+    raise RuntimeError("relaxation reached its caller-selected evaluation cap")
+```
+
+The convergence test precedes each step because the supplied forces belong to
+the current geometry. A production loop must also rebuild geometry-dependent
+model inputs before evaluating the proposal.
+
+#### Variable-cell caller loop
+
+Prepare cell state once from an aligned cell and sorted `batch_idx`:
+
+```python
+from nvalchemiops.torch.lbfgs import (
+    lbfgs_step_coord_cell,
+    prepare_lbfgs_cell_state,
+)
+
+state = prepare_lbfgs_cell_state(
+    positions,
+    cell,
+    batch_idx,
+    history_size=6,
+    cell_force_scale=1.0,
+)
+
+# Inside the caller-owned optimization loop, after evaluating the model:
+lbfgs_step_coord_cell(
+    positions,
+    forces,
+    cell,
+    cell_force,  # raw output of stress_to_cell_force(...)
+    batch_idx,
+    state,
+    maxstep=0.2,
+)
+
+if not torch.isfinite(positions).all() or not torch.isfinite(cell).all():
+    raise RuntimeError("nonfinite L-BFGS proposal")
+if torch.linalg.det(cell).min().item() <= 0.0:
+    raise RuntimeError("L-BFGS proposed a non-positive cell")
+```
+
+The operator normalizes raw cell force by `atoms_per_system *
+cell_force_scale`, as FIRE2 does. It limits realized per-atom Cartesian motion,
+including affine motion caused by the cell update; it does not impose a strain
+limit or decide whether a cell is physically acceptable. Checkpoint and restore
+both geometry and matching optimizer state if the surrounding application wants
+to recover from a rejected proposal.
+
+For JAX, enable float64 before preparing state. The functional call returns
+updated geometry and state:
+
+```python
+import jax
+import jax.numpy as jnp
+
+from nvalchemiops.jax.lbfgs import lbfgs_step_coord, prepare_lbfgs_state
+
+jax.config.update("jax_enable_x64", True)
+positions = jnp.asarray([[1.0, -0.5, 0.25]], dtype=jnp.float32)
+forces = -positions
+batch_idx = jnp.zeros(len(positions), dtype=jnp.int32)
+state = prepare_lbfgs_state(positions, num_systems=1, history_size=6)
+positions, state = lbfgs_step_coord(positions, forces, batch_idx, state)
+```
+
+When JIT-compiling a repeated loop, donate the returned geometry and complete
+state together. The variable-cell allocator keeps its reference cell in
+independent storage so the current cell and state can both be donated.
+
+#### Qualification scope
+
+The implementation was qualified for convergence behavior on the native
+120-structure, 2,278-atom OMat24 example sample with compiled float32
+MACE-MPA-0 and cuEquivariance, for fixed and variable cells at force tolerances
+of 0.02 and 0.002 eV/Å. This qualification is not a timing result and does not
+establish approximately-30,000-atom scaling. Variable-cell long-tail behavior
+is sensitive to float32 numerical variation, so applications should retain
+explicit evaluation caps and independently verify terminal geometries.
 
 ## Temperature Control Utilities
 

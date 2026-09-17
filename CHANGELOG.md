@@ -25,7 +25,10 @@
   forces to a single-step operator that updates the L-BFGS history and applies
   a caller-capped proposal. The caller owns convergence, active-batch refill,
   checkpoints, and cell validation. Coordinate data may be float32 or float64;
-  reductions and recursion coefficients remain float64.
+  reductions and recursion coefficients remain float64. The variable-cell
+  operator consumes the same raw cell-force convention as FIRE2 and checks the
+  realized coordinate-precision displacement before applying the caller's
+  Cartesian cap.
 
 - Torch and JAX Ewald now expose caller-retained reciprocal Miller topology via
   `generate_ewald_miller_indices(...)` and
