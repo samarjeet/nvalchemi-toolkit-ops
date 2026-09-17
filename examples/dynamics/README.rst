@@ -86,27 +86,6 @@ Geometry Optimization Examples
     - Per-system FIRE2 parameters adapt independently
     - Only supports ``batch_idx`` mode (no ``atom_ptr`` variant)
 
-12_lbfgs_optimization.py
-    L-BFGS geometry optimization for a single LJ cluster.
-
-    - Quasi-Newton search direction with a strong Wolfe line search
-    - Caller-driven loop: one force evaluation per ``lbfgs_step`` call
-    - Progress reported through a per-system ``status`` array
-    - Shows the full caller-owned buffer allocation, including the three
-      buffers whose initial values are not zero
-    - Head-to-head force-evaluation count against FIRE2 on the same cluster
-
-13_lbfgs_variable_cell.py
-    Variable-cell L-BFGS optimization for joint atom + cell relaxation.
-
-    - Uses ``lbfgs_step_coord_cell``, which takes the **stress** directly
-    - Positions and cell share one packed coordinate vector, so the
-      quasi-Newton recursion couples them with no special handling
-    - Shows why the reference cell is captured once, and why positions must
-      not be wrapped mid-relaxation
-    - Builds the extended topology with the generic batch utilities, which is
-      what makes ragged batches expressible
-
 11_fire2_variable_cell.py
     Variable-cell FIRE2 optimization for joint atom + cell relaxation.
 
@@ -193,7 +172,6 @@ Run from the repository root::
     python examples/dynamics/01_langevin_integration.py
     python examples/dynamics/06_fire_optimization.py
     python examples/dynamics/08_fire_batched.py
-    python examples/dynamics/12_lbfgs_optimization.py
 
 Or run interactively in VS Code or Jupyter by executing cell-by-cell
 (sections marked with ``# %%``).

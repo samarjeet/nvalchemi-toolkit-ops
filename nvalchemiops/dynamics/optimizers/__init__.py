@@ -28,10 +28,7 @@ FIRE2 (Fast Inertial Relaxation Engine v2)
     Improved FIRE with adaptive damping and velocity mixing.
 
 L-BFGS (Limited-memory Broyden-Fletcher-Goldfarb-Shanno)
-    Quasi-Newton optimization with a strong Wolfe line search. Usually reaches
-    a given force tolerance in far fewer energy/force evaluations than the
-    FIRE optimizers, which is the cost that dominates relaxation with a
-    machine-learned potential.
+    Fixed-radius quasi-Newton optimization for coordinates and cells.
 
 Main API Functions
 ------------------
@@ -52,29 +49,12 @@ fire2_update
     position/cell application. Use for custom final apply phases such as
     coupled variable-cell optimization.
 
-lbfgs_step
-    Complete L-BFGS step. Consumes exactly one energy/force evaluation per
-    call and reports progress through a per-system ``status`` array.
-    Uses batch_idx batching only.
+lbfgs_step_coord, lbfgs_step_coord_cell
+    Consume one force or force/cell-force evaluation and propose the next
+    fixed-radius geometry through explicit :class:`LBFGSState` objects.
 
-lbfgs_update
-    L-BFGS reductions, line-search decision, history update and two-loop
-    recursion WITHOUT the position update. Use with ``lbfgs_prepare_step``
-    and ``lbfgs_apply_step`` for custom apply phases.
-
-lbfgs_reduce_energy
-    Sum per-atom energies into the per-system totals ``lbfgs_step`` expects,
-    accumulating in float64.
-
-    All L-BFGS buffers are caller-owned: the package allocates and initializes
-    nothing. See :mod:`nvalchemiops.dynamics.optimizers.lbfgs` for the required
-    shapes and initial contents.
-
-lbfgs_set_reference_cell, lbfgs_cell_kappa, lbfgs_pack_cell,
-lbfgs_unpack_cell, lbfgs_cell_trust_region
-    Variable-cell relaxation. Positions and cell are mapped into a single
-    packed coordinate vector so the two-loop recursion couples them
-    automatically, then mapped back after the step.
+prepare_lbfgs_state, prepare_lbfgs_cell_state
+    Allocate caller-owned state for fixed coordinate or variable-cell topology.
 
 Kernel Selection
 ----------------
@@ -102,20 +82,12 @@ from nvalchemiops.dynamics.optimizers.fire2 import (
     fire2_update,
 )
 from nvalchemiops.dynamics.optimizers.lbfgs import (
-    LBFGS_CONVERGED,
-    LBFGS_LS_FAILED,
-    LBFGS_NEED_EVAL,
-    lbfgs_apply_step,
-    lbfgs_cell_kappa,
-    lbfgs_cell_trust_region,
-    lbfgs_pack_cell,
-    lbfgs_prepare_step,
-    lbfgs_reduce,
-    lbfgs_reduce_energy,
-    lbfgs_set_reference_cell,
-    lbfgs_step,
-    lbfgs_unpack_cell,
-    lbfgs_update,
+    LBFGSCellState,
+    LBFGSState,
+    lbfgs_step_coord,
+    lbfgs_step_coord_cell,
+    prepare_lbfgs_cell_state,
+    prepare_lbfgs_state,
 )
 
 __all__ = [
@@ -128,21 +100,13 @@ __all__ = [
     "fire2_apply_step",
     "fire2_reduce",
     # L-BFGS
-    "lbfgs_step",
-    "lbfgs_update",
-    "lbfgs_prepare_step",
-    "lbfgs_apply_step",
-    "lbfgs_reduce",
-    "lbfgs_reduce_energy",
+    "LBFGSState",
+    "prepare_lbfgs_state",
+    "lbfgs_step_coord",
     # L-BFGS variable cell
-    "lbfgs_set_reference_cell",
-    "lbfgs_cell_kappa",
-    "lbfgs_pack_cell",
-    "lbfgs_unpack_cell",
-    "lbfgs_cell_trust_region",
-    "LBFGS_NEED_EVAL",
-    "LBFGS_CONVERGED",
-    "LBFGS_LS_FAILED",
+    "LBFGSCellState",
+    "prepare_lbfgs_cell_state",
+    "lbfgs_step_coord_cell",
     # Low-level kernels
     "_fire_step_no_downhill_ptr_kernel",
     "_fire_step_downhill_ptr_kernel",

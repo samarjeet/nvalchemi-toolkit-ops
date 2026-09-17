@@ -20,38 +20,12 @@
 - New L-BFGS geometry optimizer: a Warp core in
   `nvalchemiops.dynamics.optimizers.lbfgs` with PyTorch and JAX bindings in
   `nvalchemiops.torch.lbfgs` and `nvalchemiops.jax.lbfgs`, covering both
-  coordinate-only and variable-cell relaxation. It is batched over a sorted
-  `batch_idx` and caller-driven: each step consumes exactly one energy/force
-  evaluation and reports progress through a per-system `status` array taking
-  `LBFGS_NEED_EVAL`, `LBFGS_CONVERGED` or `LBFGS_LS_FAILED`, so a whole batch
-  relaxes in one stream of kernel launches with no per-system host control flow.
-  Every buffer is caller-owned -- the package allocates nothing, initializes
-  nothing and keeps no hidden state between calls, so a step allocates no
-  memory; the module docstrings give the required shapes and initial contents.
-  Coordinates may be float32 or float64, but every per-system scalar is float64
-  because the Armijo test compares a difference of total energies, and
-  `lbfgs_reduce_energy` accumulates per-atom energies to match. The
-  variable-cell path packs positions and cell into a single coordinate vector
-  following ASE's `UnitCellFilter` convention, so the quasi-Newton recursion
-  couples them with no special handling; it supports ragged batches, and
-  convergence is always evaluated on the Cartesian forces and the stress, so
-  `force_tol` and `stress_tol` keep their physical meaning as the cell deforms.
-  The PyTorch step is a registered `torch.library` custom operator that traces
-  under `make_fx`, compiles under `torch.compile(fullgraph=True)` with zero
-  graph breaks, and captures in a CUDA graph; the JAX step declares every
-  mutable array as an input-output alias for donation, replays as a CUDA graph
-  bit-identically to the ungraphed baseline, and is deliberately not
-  differentiable. On Lennard-Jones clusters it reaches a given force tolerance
-  in roughly a seventh of the energy/force evaluations a per-case tuned FIRE2
-  needs -- worst case 0.53 -- which is the cost that dominates relaxation driven
-  by a machine-learned potential.
-- Two gallery examples, `examples/dynamics/12_lbfgs_optimization.py` (LJ
-  cluster, with a head-to-head evaluation count against FIRE2) and
-  `13_lbfgs_variable_cell.py` (FCC argon, recovering the expected 5.26 A lattice
-  constant), plus `benchmarks/dynamics/benchmark_lbfgs.py`, which compares the
-  two optimizers by evaluations to convergence and, with `--gates`, by per-step
-  cost, CUDA-graph replay speed-up and break-even model cost. Its settings live
-  in the `lbfgs` section of `benchmarks/dynamics/benchmark_config.yaml`.
+  coordinate-only and variable-cell relaxation. The API follows FIRE2's
+  caller-driven lifecycle: prepare explicit state once, then pass evaluated
+  forces to a single-step operator that updates the L-BFGS history and applies
+  a caller-capped proposal. The caller owns convergence, active-batch refill,
+  checkpoints, and cell validation. Coordinate data may be float32 or float64;
+  reductions and recursion coefficients remain float64.
 
 - Torch and JAX Ewald now expose caller-retained reciprocal Miller topology via
   `generate_ewald_miller_indices(...)` and

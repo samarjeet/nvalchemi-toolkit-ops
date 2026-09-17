@@ -92,7 +92,15 @@ def scoped_warp_stream(device: torch.device | str):
     wp_stream = wp.get_stream(str(torch_device))
     if wp_stream.cuda_stream == torch_stream.cuda_stream:
         return nullcontext()
-    return wp.ScopedStream(wp.stream_from_torch(torch_stream))
+    # CUDA graph capture cannot introduce a dependency on uncaptured work from
+    # Warp's previously current stream. Torch has already established the
+    # ordering for its capture stream, so switching Warp to that same stream
+    # must not emit an entry synchronization while capture is active.
+    sync_enter = not torch.cuda.is_current_stream_capturing()
+    return wp.ScopedStream(
+        wp.stream_from_torch(torch_stream),
+        sync_enter=sync_enter,
+    )
 
 
 def register_noop_fake(op) -> None:

@@ -43,26 +43,20 @@ For advanced use cases where you manage packed extended arrays directly.
 L-BFGS Optimizer
 ----------------
 
-Quasi-Newton relaxation with a strong Wolfe line search. Each step consumes one
-energy/force evaluation and reports progress through the ``status`` buffer.
+Fixed-radius quasi-Newton relaxation. Each call consumes evaluated forces (and
+raw cell force for cell relaxation), accepts that point as the current base,
+and proposes the next geometry through explicit caller-owned state.
 
 .. note::
-   Every optimizer buffer is caller-owned: nothing here allocates or
-   initializes state on your behalf. Zero the buffers, then set ``alpha_step``
-   to ``1.0``, ``iteration`` to ``-1`` and ``status`` to ``LBFGS_NEED_EVAL``.
-   The module documentation lists the required shapes and dtypes.
+   Use ``prepare_lbfgs_state`` or ``prepare_lbfgs_cell_state`` to create the
+   state passed to every step.
 
-.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_reduce_energy
 .. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_step_coord
-.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_step_extended
 
 Variable-cell relaxation maps coordinates and cell into one packed coordinate
-vector, so the two-loop recursion couples them automatically. Build
-``ext_atom_ptr`` and ``ext_batch_idx`` with
-:func:`~nvalchemiops.dynamics.utils.cell_filter.extend_atom_ptr` and
-:func:`~nvalchemiops.batch_utils.atom_ptr_to_batch_idx`, which handle ragged
-batches as well as uniform ones.
+vector, so the two-loop recursion couples them automatically.
+The cell-state allocator derives and stores the extended topology from the sorted ``batch_idx`` input.
 
-.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_set_reference_cell
-.. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_cell_kappa
+.. autofunction:: nvalchemiops.torch.lbfgs.prepare_lbfgs_state
+.. autofunction:: nvalchemiops.torch.lbfgs.prepare_lbfgs_cell_state
 .. autofunction:: nvalchemiops.torch.lbfgs.lbfgs_step_coord_cell
