@@ -675,6 +675,112 @@ class TestFrozenReciprocalContraction:
 
 
 @pytest.mark.gpu
+class TestModulusConventions:
+    """The public JAX binding supports both Fourier modulus conventions."""
+
+    def test_default_matches_explicit_exact_moduli(self, device, system):
+        """The default retains the discrete modulus behaviour."""
+        default = _evaluate(system, compute_virial=True)
+        explicit = _evaluate(system, exact_moduli=True, compute_virial=True)
+        for actual, expected in zip(default, explicit, strict=True):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), rtol=1e-12, atol=1e-12
+            )
+
+    @pytest.mark.parametrize("exact_moduli", [True, False])
+    def test_both_conventions_return_finite_outputs(self, device, system, exact_moduli):
+        """Both modulus constructions produce finite energy, force, and virial outputs."""
+        energy, forces, virial = _evaluate(
+            system, exact_moduli=exact_moduli, compute_virial=True
+        )
+        assert jnp.isfinite(energy).all()
+        assert jnp.isfinite(forces).all()
+        assert jnp.isfinite(virial).all()
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64])
+    @pytest.mark.parametrize("exact_moduli", [True, False])
+    def test_matches_torch_public_call(self, device, system, dtype, exact_moduli):
+        """Matched public inputs agree with the Torch binding in each convention."""
+        torch = pytest.importorskip("torch", reason="PyTorch not installed.")
+        if not torch.cuda.is_available():
+            pytest.skip("No CUDA device available for the Torch binding.")
+        from nvalchemiops.torch.interactions.dispersion import (  # noqa: PLC0415
+            FourierD3Parameters as TorchFourierD3Parameters,
+        )
+        from nvalchemiops.torch.interactions.dispersion import (
+            fourier_dftd3 as torch_fourier_dftd3,
+        )
+
+        raw = system["numpy"]
+        jax_system = {
+            **system,
+            "positions": jnp.asarray(raw["positions"], dtype=dtype),
+            "numbers": jnp.asarray(raw["numbers"], dtype=jnp.int32),
+            "cell": jnp.asarray(raw["cell"], dtype=dtype),
+            "params": FourierD3Parameters.from_tables(
+                raw["rcov"],
+                raw["r4r2"],
+                raw["c6ab"],
+                raw["cn_ref"],
+                raw["species"],
+                dtype=dtype,
+            ),
+        }
+        jax_outputs = _evaluate(
+            jax_system, exact_moduli=exact_moduli, compute_virial=True
+        )
+
+        torch_dtype = torch.float32 if dtype == jnp.float32 else torch.float64
+
+        def tensor(array, tensor_dtype=torch_dtype):
+            return torch.as_tensor(
+                np.ascontiguousarray(array), dtype=tensor_dtype, device="cuda:0"
+            )
+
+        torch_params = TorchFourierD3Parameters.from_tables(
+            tensor(raw["rcov"]),
+            tensor(raw["r4r2"]),
+            tensor(raw["c6ab"]),
+            tensor(raw["cn_ref"]),
+            raw["species"],
+            device="cuda:0",
+            dtype=torch_dtype,
+        )
+        torch_outputs = torch_fourier_dftd3(
+            tensor(raw["positions"]),
+            tensor(raw["numbers"], torch.int32),
+            **DAMPING,
+            fd3_params=torch_params,
+            cell=tensor(raw["cell"]),
+            r_cut=R_CUT,
+            mesh_dimensions=MESH,
+            neighbor_list=tensor(
+                np.stack(
+                    [
+                        np.repeat(np.arange(raw["n_atoms"]), np.diff(raw["pointer"])),
+                        raw["targets"],
+                    ]
+                ),
+                torch.int32,
+            ),
+            neighbor_ptr=tensor(raw["pointer"], torch.int32),
+            unit_shifts=tensor(raw["shifts"], torch.int32),
+            exact_moduli=exact_moduli,
+            compute_virial=True,
+        )
+
+        rtol, atol = (2e-5, 2e-6) if dtype == jnp.float32 else (1e-10, 1e-11)
+        for actual, expected in zip(
+            jax_outputs,
+            (output.detach().cpu().numpy() for output in torch_outputs),
+            strict=True,
+        ):
+            np.testing.assert_allclose(
+                np.asarray(actual), expected, rtol=rtol, atol=atol
+            )
+
+
+@pytest.mark.gpu
 class TestNeighbourFormats:
     """Both neighbour representations, and the validation around them."""
 
@@ -804,6 +910,53 @@ class TestJit:
             np.asarray(eager[1]),
             atol=1e-12 * float(jnp.abs(eager[1]).max()),
         )
+
+    @pytest.mark.parametrize("exact_moduli", [True, False])
+    def test_both_modulus_conventions_match_eager_under_jit(
+        self, device, system, exact_moduli
+    ):
+        """A host-static modulus convention can be closed over by ``jax.jit``."""
+        eager = _evaluate(system, exact_moduli=exact_moduli, compute_virial=True)
+
+        def evaluate(positions):
+            return fourier_dftd3(
+                positions,
+                system["numbers"],
+                fd3_params=system["params"],
+                cell=system["cell"],
+                r_cut=R_CUT,
+                mesh_dimensions=MESH,
+                neighbor_list=system["neighbor_list"],
+                neighbor_ptr=system["neighbor_ptr"],
+                unit_shifts=system["unit_shifts"],
+                exact_moduli=exact_moduli,
+                compute_virial=True,
+                **DAMPING,
+            )
+
+        traced = jax.jit(evaluate)(system["positions"])
+        for actual, expected in zip(traced, eager, strict=True):
+            np.testing.assert_allclose(
+                np.asarray(actual),
+                np.asarray(expected),
+                rtol=1e-12,
+                atol=1e-12 * max(1.0, float(jnp.abs(expected).max())),
+            )
+
+    @pytest.mark.parametrize("invalid", [None, 1, 0.0, "true", jnp.asarray(True)])
+    def test_rejects_non_boolean_modulus_configuration(self, device, system, invalid):
+        """Only Python and NumPy booleans are valid modulus configuration values."""
+        with pytest.raises(TypeError, match="Python or NumPy boolean"):
+            _evaluate(system, exact_moduli=invalid)
+
+    def test_rejects_traced_runtime_modulus_configuration(self, device, system):
+        """A runtime JAX boolean must be static for ``jax.jit``."""
+
+        def evaluate(exact_moduli):
+            return _evaluate(system, exact_moduli=exact_moduli)
+
+        with pytest.raises(TypeError, match="close over the flag|static argument"):
+            jax.jit(evaluate)(jnp.asarray(True))
 
     def test_mesh_spacing_is_rejected_while_tracing(self, device, system):
         """``mesh_spacing`` reads cell lengths, so it cannot be used inside ``jax.jit``.

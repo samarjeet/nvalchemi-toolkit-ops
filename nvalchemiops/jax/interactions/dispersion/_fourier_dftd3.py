@@ -261,6 +261,16 @@ def _resolve_mesh(mesh_dimensions, mesh_spacing, cells, spline_order):
     )
 
 
+def _validate_exact_moduli(exact_moduli):
+    """Require the modulus convention to be host-static Python configuration."""
+    if not isinstance(exact_moduli, (bool, np.bool_)):
+        raise TypeError(
+            "exact_moduli must be a Python or NumPy boolean. Under jax.jit, close over "
+            "the flag or pass it as a static argument."
+        )
+    return bool(exact_moduli)
+
+
 def _reject_half_filled(
     neighbor_list,
     unit_shifts,
@@ -330,6 +340,7 @@ def fourier_dftd3(
     batch_idx=None,
     compute_virial: bool = False,
     num_systems: int | None = None,
+    exact_moduli: bool = True,
 ):
     r"""Evaluate the DFT-D3(BJ) dispersion correction by particle-mesh summation.
 
@@ -379,6 +390,10 @@ def fourier_dftd3(
         Whether to return the virial.
     num_systems : int, optional
         Number of systems. Inferred from ``cell`` when omitted.
+    exact_moduli : bool, default=True
+        Use the exact discrete B-spline modulus. Set to ``False`` to use the continuous
+        ``sinc(m/N)**p`` convention. This is host-static configuration under ``jax.jit``;
+        close over it or mark it as a static argument.
 
     Returns
     -------
@@ -387,6 +402,7 @@ def fourier_dftd3(
     virial : jax.Array, shape (num_systems, 3, 3)
         Returned only when ``compute_virial`` is set. This is ``dE/d(strain)``.
     """
+    exact_moduli = _validate_exact_moduli(exact_moduli)
     matrix_given = neighbor_matrix is not None
     list_given = neighbor_list is not None
     if matrix_given and list_given:
@@ -528,7 +544,7 @@ def fourier_dftd3(
     miller_y = jnp.fft.fftfreq(mesh_ny, d=1.0 / mesh_ny).astype(dtype)
     miller_z = jnp.fft.rfftfreq(mesh_nz, d=1.0 / mesh_nz).astype(dtype)
     moduli = [
-        _bspline_moduli(m, n, spline_order, dtype)
+        _bspline_moduli(m, n, spline_order, exact_moduli, dtype)
         for m, n in ((miller_x, mesh_nx), (miller_y, mesh_ny), (miller_z, mesh_nz))
     ]
     volumes = jnp.abs(jnp.linalg.det(cells)).astype(dtype)
@@ -662,13 +678,16 @@ def _cardinal_bspline(u, order):
     return (u * lower + (float(order) - u) * shifted) / float(order - 1)
 
 
-def _bspline_moduli(miller, mesh_size, spline_order, dtype):
+def _bspline_moduli(miller, mesh_size, spline_order, exact, dtype):
     """Discrete B-spline attenuation for one mesh axis.
 
     The magnitude of the DFT of the spline coefficients, which is what interpolation on a
     finite mesh actually applies. The Nyquist bin of an even mesh can vanish, which would
     divide by zero during deconvolution, so it is replaced by the mean of its neighbours.
     """
+    if not exact:
+        return (jnp.sinc(miller / mesh_size) ** spline_order).astype(dtype)
+
     nodes = jnp.arange(spline_order, dtype=dtype) + 1.0
     coefficients = (
         jnp.zeros(mesh_size, dtype=dtype)
