@@ -763,6 +763,19 @@ def _validate_mesh_dimensions(mesh_dimensions, spline_order):
         )
 
 
+def _smooth_mesh_size(size):
+    """Round a mesh size up to an integer with only small prime factors."""
+    candidate = int(size)
+    while True:
+        remainder = candidate
+        for prime in (2, 3, 5, 7):
+            while remainder % prime == 0:
+                remainder //= prime
+        if remainder == 1:
+            return candidate
+        candidate += 1
+
+
 def _resolve_mesh(mesh_dimensions, mesh_spacing, cells, spline_order):
     """Settle the mesh size, requiring exactly one of the two ways of asking for it.
 
@@ -784,7 +797,7 @@ def _resolve_mesh(mesh_dimensions, mesh_spacing, cells, spline_order):
     lengths = torch.linalg.norm(cells, dim=-1).max(dim=0).values
     minimum = max(spline_order, 3)
     return tuple(
-        max(minimum, int(torch.ceil(length / mesh_spacing).item()))
+        _smooth_mesh_size(max(minimum, int(torch.ceil(length / mesh_spacing).item())))
         for length in lengths
     )
 

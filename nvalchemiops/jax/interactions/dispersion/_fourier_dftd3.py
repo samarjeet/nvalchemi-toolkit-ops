@@ -222,6 +222,19 @@ def _validate_mesh_dimensions(mesh_dimensions, spline_order):
         )
 
 
+def _smooth_mesh_size(size):
+    """Round a mesh size up to an integer with only small prime factors."""
+    candidate = int(size)
+    while True:
+        remainder = candidate
+        for prime in (2, 3, 5, 7):
+            while remainder % prime == 0:
+                remainder //= prime
+        if remainder == 1:
+            return candidate
+        candidate += 1
+
+
 def _resolve_mesh(mesh_dimensions, mesh_spacing, cells, spline_order):
     """Settle the mesh size, requiring exactly one of the two ways of asking for it."""
     if (mesh_dimensions is None) == (mesh_spacing is None):
@@ -243,7 +256,8 @@ def _resolve_mesh(mesh_dimensions, mesh_spacing, cells, spline_order):
         ) from None
     minimum = max(spline_order, 3)
     return tuple(
-        max(minimum, int(np.ceil(length / mesh_spacing))) for length in lengths
+        _smooth_mesh_size(max(minimum, int(np.ceil(length / mesh_spacing))))
+        for length in lengths
     )
 
 

@@ -236,7 +236,7 @@ def _fixed_triclinic_system(dtype):
     }
 
 
-def _single(box, seed):
+def _single(box, seed, cell=None):
     """One periodic cell, as plain NumPy, with its neighbour list in both formats."""
     rng = np.random.default_rng(seed)
     c6ab, cn_ref, species = _reference_tables()
@@ -246,9 +246,13 @@ def _single(box, seed):
     r4r2 = np.zeros(max_z)
     r4r2[[1, 6, 8]] = [1.0, 1.4, 1.2]
     n_atoms = 8
-    positions = rng.uniform(0.0, box, (n_atoms, 3))
+    if cell is None:
+        cell = np.eye(3) * box
+        positions = rng.uniform(0.0, box, (n_atoms, 3))
+    else:
+        cell = np.asarray(cell, dtype=np.float64)
+        positions = rng.uniform(0.1, 0.9, (n_atoms, 3)) @ cell
     numbers = rng.choice(species, n_atoms)
-    cell = np.eye(3) * box
     targets, pointer, shifts, _ = _neighbour_list(positions, cell, R_CUT)
     matrix, matrix_shifts = _to_dense(targets, pointer, shifts, n_atoms)
     return dict(
@@ -263,16 +267,10 @@ def _single(box, seed):
 
 
 def _dense_call(
-    parts, cells, matrix, matrix_shifts, batch_idx, num_systems, fill_value
+    parts, cells, matrix, matrix_shifts, batch_idx, num_systems, fill_value, **kwargs
 ):
     """Evaluate in the dense neighbour format."""
-    return fourier_dftd3(
-        jnp.asarray(parts["positions"]),
-        jnp.asarray(parts["numbers"], dtype=jnp.int32),
-        **DAMPING,
-        fd3_params=parts["params"],
-        cell=jnp.asarray(cells),
-        r_cut=R_CUT,
+    arguments = dict(
         mesh_dimensions=MESH,
         neighbor_matrix=jnp.asarray(matrix, dtype=jnp.int32),
         neighbor_matrix_shifts=jnp.asarray(matrix_shifts, dtype=jnp.int32),
@@ -281,6 +279,16 @@ def _dense_call(
         if batch_idx is None
         else jnp.asarray(batch_idx, dtype=jnp.int32),
         num_systems=num_systems,
+    )
+    arguments.update(kwargs)
+    return fourier_dftd3(
+        jnp.asarray(parts["positions"]),
+        jnp.asarray(parts["numbers"], dtype=jnp.int32),
+        **DAMPING,
+        fd3_params=parts["params"],
+        cell=jnp.asarray(cells),
+        r_cut=R_CUT,
+        **arguments,
     )
 
 
@@ -348,6 +356,76 @@ class TestMeshSizing:
             np.asarray(by_dimensions[1]),
             atol=1e-11 * float(jnp.abs(by_dimensions[1]).max()),
         )
+
+    def test_batched_spacing_matches_smooth_explicit_mesh(self, device):
+        """Automatic sizing uses all batched axes and matches the rounded public result."""
+        cells = [
+            np.diag([17.0, 6.0, 5.0]),
+            np.diag([5.0, 11.0, 6.0]),
+            np.diag([7.0, 8.0, 13.0]),
+        ]
+        systems = [_single(0.0, index, cell=cell) for index, cell in enumerate(cells)]
+        counts = [system["n_atoms"] for system in systems]
+        total = sum(counts)
+        offsets = np.cumsum([0] + counts[:-1])
+        width = max(system["matrix"].shape[1] for system in systems)
+        matrices, matrix_shifts = [], []
+        for system, offset in zip(systems, offsets, strict=True):
+            matrix = np.full((system["n_atoms"], width), total, dtype=np.int32)
+            shifts = np.zeros((system["n_atoms"], width, 3), dtype=np.int32)
+            padded = system["matrix"] >= system["n_atoms"]
+            matrix[:, : system["matrix"].shape[1]] = np.where(
+                padded, total, system["matrix"] + int(offset)
+            )
+            shifts[:, : system["matrix_shifts"].shape[1]] = system["matrix_shifts"]
+            matrices.append(matrix)
+            matrix_shifts.append(shifts)
+        batch = dict(
+            positions=np.concatenate([system["positions"] for system in systems]),
+            numbers=np.concatenate([system["numbers"] for system in systems]),
+            params=systems[0]["params"],
+        )
+        batch_idx = np.concatenate(
+            [
+                np.full(count, index, dtype=np.int32)
+                for index, count in enumerate(counts)
+            ]
+        )
+        common = dict(
+            parts=batch,
+            cells=np.stack(cells),
+            matrix=np.concatenate(matrices),
+            matrix_shifts=np.concatenate(matrix_shifts),
+            batch_idx=batch_idx,
+            num_systems=len(systems),
+            fill_value=total,
+            compute_virial=True,
+        )
+        automatic = _dense_call(**common, mesh_dimensions=None, mesh_spacing=1.0)
+        explicit = _dense_call(
+            **common, mesh_dimensions=(18, 12, 14), mesh_spacing=None
+        )
+        for actual, expected in zip(automatic, explicit, strict=True):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), rtol=1e-12
+            )
+        lengths = np.linalg.norm(np.stack(cells), axis=-1).max(axis=0)
+        assert all(
+            length / dimension <= 1.0
+            for length, dimension in zip(lengths, (18, 12, 14), strict=True)
+        )
+
+    def test_explicit_non_smooth_mesh_is_accepted_publicly(self, device, system):
+        """A valid non-smooth explicit mesh remains usable through the public API."""
+        energy, forces, virial = _evaluate(
+            system,
+            mesh_dimensions=(17, 19, 23),
+            mesh_spacing=None,
+            compute_virial=True,
+        )
+        assert jnp.isfinite(energy).all()
+        assert jnp.isfinite(forces).all()
+        assert jnp.isfinite(virial).all()
 
 
 @pytest.mark.gpu

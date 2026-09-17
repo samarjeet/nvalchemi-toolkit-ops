@@ -820,6 +820,58 @@ class TestMeshAndUnits:
             atol=1e-11 * float(by_dimensions[1].abs().max()),
         )
 
+    def test_batched_spacing_matches_smooth_explicit_mesh(self):
+        """Automatic sizing uses all batched axes and matches the rounded public result."""
+        cells = [
+            np.diag([17.0, 6.0, 5.0]),
+            np.diag([5.0, 11.0, 6.0]),
+            np.diag([7.0, 8.0, 13.0]),
+        ]
+        systems = [
+            _system("cuda:0", seed=index, cell=cell) for index, cell in enumerate(cells)
+        ]
+        batch = _batched(systems)
+        automatic = _evaluate(
+            batch,
+            batch_idx=batch["batch_idx"],
+            num_systems=batch["num_systems"],
+            mesh_dimensions=None,
+            mesh_spacing=1.0,
+            exact_moduli=True,
+            compute_virial=True,
+        )
+        explicit = _evaluate(
+            batch,
+            batch_idx=batch["batch_idx"],
+            num_systems=batch["num_systems"],
+            mesh_dimensions=(18, 12, 14),
+            mesh_spacing=None,
+            exact_moduli=True,
+            compute_virial=True,
+        )
+        for actual, expected in zip(automatic, explicit, strict=True):
+            np.testing.assert_allclose(
+                actual.cpu().numpy(), expected.cpu().numpy(), rtol=1e-12, atol=1e-12
+            )
+        lengths = torch.linalg.norm(batch["cell"], dim=-1).amax(dim=0)
+        assert all(
+            float(length) / dimension <= 1.0
+            for length, dimension in zip(lengths, (18, 12, 14), strict=True)
+        )
+
+    def test_explicit_non_smooth_mesh_is_accepted_publicly(self):
+        """A valid non-smooth explicit mesh remains usable through the public API."""
+        system = _system("cuda:0")
+        energy, forces, virial = _evaluate(
+            system,
+            mesh_dimensions=(17, 19, 23),
+            mesh_spacing=None,
+            compute_virial=True,
+        )
+        assert torch.isfinite(energy).all()
+        assert torch.isfinite(forces).all()
+        assert torch.isfinite(virial).all()
+
     def test_rejects_bad_mesh_arguments(self):
         """Degenerate mesh requests are rejected rather than clamped."""
         system = _system("cuda:0")
